@@ -44,6 +44,8 @@ class ManagedBrowserSession:
     expires_at: float
     last_seen: float = field(default_factory=time.monotonic)
     sync_task: asyncio.Task | None = None
+    connected_clients: int = 0
+    disconnect_task: asyncio.Task | None = None
 
 
 def _domain_allowed(domain: str, allowed: tuple[str, ...]) -> bool:
@@ -207,6 +209,11 @@ class BrowserSessionManager:
         item = self.sessions.pop(session_id, None)
         if not item:
             return
+        current_task = asyncio.current_task()
+        if item.disconnect_task and item.disconnect_task is not current_task:
+            item.disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await item.disconnect_task
         if item.sync_task:
             item.sync_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -238,6 +245,12 @@ class BrowserSessionManager:
         if not item or websocket.headers.get("origin", "").rstrip("/") != expected_origin:
             await websocket.close(code=4401)
             return
+        if item.disconnect_task:
+            item.disconnect_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await item.disconnect_task
+            item.disconnect_task = None
+        item.connected_clients += 1
         await websocket.accept()
 
         async def send_frames() -> None:
@@ -292,8 +305,20 @@ class BrowserSessionManager:
         await asyncio.gather(*done, *pending, return_exceptions=True)
         if item.expires_at <= time.monotonic():
             await self.close(item.id)
+        elif item.id in self.sessions:
+            item.connected_clients = max(0, item.connected_clients - 1)
+            if item.connected_clients == 0:
+                item.disconnect_task = asyncio.create_task(
+                    self._close_after_disconnect(item.id)
+                )
         with suppress(Exception):
             await websocket.close()
+
+    async def _close_after_disconnect(self, session_id: str) -> None:
+        await asyncio.sleep(10)
+        item = self.sessions.get(session_id)
+        if item and item.connected_clients == 0:
+            await self.close(session_id)
 
     async def _handle_event(self, item: ManagedBrowserSession, event: dict) -> bool:
         kind = event.get("type")
