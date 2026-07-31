@@ -18,6 +18,7 @@ Este container cuida somente de cookies criptografados e sessões Playwright.
 - auditoria sem valores sensíveis;
 - Dockerfile e configuração Railway;
 - migration PostgreSQL/Supabase com tabelas prefixadas;
+- inicialização idempotente das tabelas em PostgreSQL próprio do Railway;
 - Edge Function e cliente TypeScript de integração.
 
 ## Arquitetura
@@ -42,8 +43,13 @@ Container Railway
   └── WebSocket remoto
           │
           ▼
-PostgreSQL do Supabase
+PostgreSQL do Supabase ou Railway
 ```
+
+Quando o banco for o PostgreSQL do próprio Railway, configure
+`DATABASE_URL=${{Postgres.DATABASE_URL}}`. As tabelas prefixadas são criadas
+automaticamente na inicialização; o Lovable Cloud continua responsável pela
+autenticação e pela integração server-side.
 
 ## Estrutura
 

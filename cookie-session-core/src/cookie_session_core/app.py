@@ -7,6 +7,7 @@ import secrets
 import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, suppress
+from importlib.resources import files
 from pathlib import Path
 from urllib.parse import quote
 from uuid import UUID
@@ -58,6 +59,8 @@ async def lifespan(app: FastAPI):
         command_timeout=30,
     )
     await pool.fetchval("SELECT 1")
+    schema = files("cookie_session_core").joinpath("schema.sql").read_text(encoding="utf-8")
+    await pool.execute(schema)
     core = CookieSessionCore(pool, settings.vault_key, settings.token_pepper)
     browsers = BrowserSessionManager(settings, core)
     await browsers.start()

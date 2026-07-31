@@ -48,6 +48,26 @@ Não mova o frontend para dentro dessa pasta.
 
 ## 4. Aplicar a migration no Supabase
 
+### Alternativa para projetos que usam Lovable Cloud
+
+Se o projeto não oferece acesso ao painel do Supabase, adicione um serviço
+PostgreSQL no mesmo projeto Railway e use:
+
+```text
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+```
+
+Nesta modalidade não execute o `schema.sql` manualmente. O Cookie Session Core
+cria e atualiza de forma idempotente as próprias tabelas prefixadas ao iniciar.
+O banco do Railway guarda somente os dados internos do Cookie Core; usuários e
+login continuam no Lovable Cloud.
+
+Os valores públicos `SUPABASE_URL` e `SUPABASE_PUBLISHABLE_KEY` podem ser obtidos
+das variáveis `VITE_SUPABASE_URL` e `VITE_SUPABASE_PUBLISHABLE_KEY` do projeto
+Lovable. Nunca use uma chave `service_role` no frontend.
+
+### Projetos com acesso ao Supabase
+
 O arquivo é:
 
 ```text
@@ -105,7 +125,7 @@ O terceiro valor também será cadastrado no Supabase como
 
 Não reutilize senha do banco, JWT secret ou chave do Supabase.
 
-## 6. Obter dados do Supabase
+## 6. Obter dados de autenticação e banco
 
 Separe:
 
@@ -118,6 +138,9 @@ SUPABASE_PUBLISHABLE_KEY
 Use uma connection string PostgreSQL server-side com SSL. Se usar o pooler do
 Supabase, escolha um modo compatível com conexões persistentes do `asyncpg`.
 Nunca coloque `DATABASE_URL` no Lovable ou em variável `VITE_`.
+
+Se estiver usando o PostgreSQL do Railway, `DATABASE_URL` deve ser uma referência
+privada a `${{Postgres.DATABASE_URL}}`, não uma URL copiada para o frontend.
 
 ## 7. Criar o serviço no Railway
 
