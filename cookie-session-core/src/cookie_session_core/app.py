@@ -27,7 +27,7 @@ from .reverse_proxy import ReverseProxy
 from .schemas import CfClearanceInject, CfSolveUrlInput, CookieImport, LaunchInput, ServiceInput
 
 logger = logging.getLogger("cookie_session_core")
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.7.0"
 
 
 class RateLimiter:
