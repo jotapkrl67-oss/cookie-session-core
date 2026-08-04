@@ -123,6 +123,44 @@ class NavigationState(str, Enum):
     FAILED = "failed"
 
 
+_TRANSPORT_COOKIE_FIELDS = (
+    "name",
+    "value",
+    "domain",
+    "path",
+    "expires",
+    "httpOnly",
+    "secure",
+    "sameSite",
+)
+
+
+def _transport_cookies(cookies: list[Any], settings: Settings) -> list[dict[str, Any]]:
+    """Project browser cookies onto the versioned transport contract.
+
+    Partitioned cookies (CHIPS) depend on a browser top-level-site partition.
+    Replaying them as ordinary HTTP cookies would change their security scope,
+    so they are deliberately excluded rather than silently de-partitioned.
+    """
+    if len(cookies) > settings.max_response_cookies:
+        raise HTTPException(502, "Browser returned too many cookies")
+    output: list[dict[str, Any]] = []
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            raise HTTPException(502, "Browser returned an invalid cookie")
+        if cookie.get("partitionKey"):
+            continue
+        value = cookie.get("value")
+        if not isinstance(value, str) or len(value.encode()) > settings.max_cookie_value_bytes:
+            raise HTTPException(502, "Browser returned an invalid cookie")
+        output.append(
+            {field: cookie[field] for field in _TRANSPORT_COOKIE_FIELDS if field in cookie}
+        )
+    if not any(cookie.get("name") == "cf_clearance" for cookie in output):
+        raise HTTPException(502, "Clearance cannot be represented by the transport contract")
+    return output
+
+
 def _is_public_ip(value: str) -> bool:
     try:
         ip = ipaddress.ip_address(value)
@@ -352,21 +390,18 @@ async def _solve_with_browser(url: str, settings: Settings, browser: Browser) ->
                 raise HTTPException(409, "Interactive challenge requires manual completion")
             state = NavigationState.TIMED_OUT
             raise HTTPException(504, "Cloudflare did not issue clearance before timeout")
-        if len(cookies) > settings.max_response_cookies:
-            raise HTTPException(502, "Browser returned too many cookies")
-        for cookie in cookies:
-            value = cookie.get("value")
-            if not isinstance(value, str) or len(value.encode()) > settings.max_cookie_value_bytes:
-                raise HTTPException(502, "Browser returned an invalid cookie")
+        response_cookies = _transport_cookies(cookies, settings)
         user_agent = await page.evaluate("navigator.userAgent")
-        clearance = next(cookie for cookie in cookies if cookie.get("name") == "cf_clearance")
+        clearance = next(
+            cookie for cookie in response_cookies if cookie.get("name") == "cf_clearance"
+        )
         clearance_expiry = float(clearance.get("expires") or -1)
         expires_at = clearance_expiry if clearance_expiry > time.time() else None
         state = NavigationState.COMPLETED
         return {
             "schemaVersion": 1,
             "requestId": uuid4().hex,
-            "cookies": cookies,
+            "cookies": response_cookies,
             "userAgent": user_agent,
             "expiresAt": expires_at,
         }

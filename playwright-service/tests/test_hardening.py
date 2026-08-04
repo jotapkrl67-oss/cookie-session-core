@@ -5,7 +5,12 @@ import socket
 
 import pytest
 from fastapi import HTTPException
-from playwright_service.app import Settings, SolveCapacity, _validate_public_url
+from playwright_service.app import (
+    Settings,
+    SolveCapacity,
+    _transport_cookies,
+    _validate_public_url,
+)
 
 
 @pytest.mark.asyncio
@@ -60,3 +65,38 @@ async def test_capacity_rejects_when_queue_is_full():
     release.set()
     await task
     assert capacity.active == capacity.queued == 0
+
+
+def test_transport_contract_drops_partitioned_and_unknown_cookie_fields():
+    settings = Settings(playwright_service_token="t" * 32)
+    cookies = [
+        {
+            "name": "partitioned",
+            "value": "not-replayable",
+            "domain": ".example.com",
+            "path": "/",
+            "expires": 1_900_000_000,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "None",
+            "partitionKey": "https://top-level.example",
+        },
+        {
+            "name": "cf_clearance",
+            "value": "clearance",
+            "domain": ".example.com",
+            "path": "/",
+            "expires": 1_900_000_000,
+            "httpOnly": True,
+            "secure": True,
+            "sameSite": "None",
+            "unexpectedBrowserField": "must-not-cross-contract",
+        },
+    ]
+
+    result = _transport_cookies(cookies, settings)
+
+    assert len(result) == 1
+    assert result[0]["name"] == "cf_clearance"
+    assert "partitionKey" not in result[0]
+    assert "unexpectedBrowserField" not in result[0]
