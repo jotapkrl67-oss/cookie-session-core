@@ -4,12 +4,13 @@ import asyncio
 import socket
 
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from playwright_service.app import (
     Settings,
     SolveCapacity,
     _transport_cookies,
     _validate_public_url,
+    sanitized_http_error,
 )
 
 
@@ -100,3 +101,25 @@ def test_transport_contract_drops_partitioned_and_unknown_cookie_fields():
     assert result[0]["name"] == "cf_clearance"
     assert "partitionKey" not in result[0]
     assert "unexpectedBrowserField" not in result[0]
+
+
+@pytest.mark.asyncio
+async def test_solve_error_response_is_sanitized(caplog):
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/solve",
+        "headers": [],
+        "query_string": b"",
+        "server": ("test", 443),
+        "client": ("127.0.0.1", 1),
+        "scheme": "https",
+    }
+    request = Request(scope)
+    with caplog.at_level("WARNING", logger="uvicorn.error"):
+        response = await sanitized_http_error(
+            request, HTTPException(502, "Browser operation failed")
+        )
+    assert response.status_code == 502
+    assert b'"detail":"Browser operation failed"' in response.body
+    assert "Browser operation failed" in caplog.text
