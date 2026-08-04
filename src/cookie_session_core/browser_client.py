@@ -25,6 +25,7 @@ from .cloudflare_detection import (
 from .cloudflare_provider import (
     CloudflareCookieCoordinator,
     CloudflareCookieProvider,
+    CloudflareCookieProviderError,
     CloudflareSessionStore,
 )
 from .metrics import metrics
@@ -1355,10 +1356,16 @@ class BrowserLikeClient:
                         observed_generation=observed_provider_generation,
                     )
                 except Exception as exc:
+                    detail = (
+                        str(exc)
+                        if isinstance(exc, CloudflareCookieProviderError)
+                        else "Clearance solve failed"
+                    )
                     logger.warning(
-                        "Cloudflare cookie provider failed domain=%s error=%s",
+                        "Cloudflare cookie provider failed domain=%s category=%s detail=%s",
                         domain,
                         type(exc).__name__,
+                        detail,
                     )
                 else:
                     observed_provider_generation = session.generation
