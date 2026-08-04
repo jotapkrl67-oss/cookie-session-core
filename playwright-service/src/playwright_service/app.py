@@ -16,13 +16,16 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from playwright.async_api import Browser, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-logger = logging.getLogger("playwright_service")
+# Uvicorn owns the production logging configuration. Using its error logger
+# guarantees that sanitized lifecycle/solve diagnostics reach Railway stdout.
+logger = logging.getLogger("uvicorn.error")
 
 
 class Settings(BaseSettings):
@@ -301,6 +304,24 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(HTTPException)
+async def sanitized_http_error(request: Request, exc: HTTPException):
+    request_id = request.headers.get("x-request-id") or uuid4().hex
+    detail = str(exc.detail) if isinstance(exc.detail, str) else "Request failed"
+    if request.url.path == "/solve":
+        logger.warning(
+            "solve_failed request_id=%s status=%s category=%s",
+            request_id,
+            exc.status_code,
+            detail,
+        )
+    return JSONResponse(
+        {"detail": detail, "requestId": request_id},
+        status_code=exc.status_code,
+        headers=exc.headers,
+    )
 
 
 @app.get("/health/live")
