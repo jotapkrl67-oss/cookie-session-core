@@ -6,11 +6,13 @@ import hmac
 import ipaddress
 import json
 import logging
+import re
 import socket
 import time
 from contextlib import asynccontextmanager, suppress
 from enum import Enum
 from functools import lru_cache
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -26,6 +28,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Uvicorn owns the production logging configuration. Using its error logger
 # guarantees that sanitized lifecycle/solve diagnostics reach Railway stdout.
 logger = logging.getLogger("uvicorn.error")
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
+
+
+def _request_id(request: Request) -> str:
+    supplied = request.headers.get("x-request-id", "")
+    return supplied if _SAFE_REQUEST_ID.fullmatch(supplied) else uuid4().hex
 
 
 class Settings(BaseSettings):
@@ -42,6 +50,7 @@ class Settings(BaseSettings):
     max_response_cookies: int = Field(default=100, ge=1, le=500)
     max_cookie_value_bytes: int = Field(default=8192, ge=256, le=65536)
     max_redirects: int = Field(default=10, ge=0, le=30)
+    dns_cache_seconds: int = Field(default=10, ge=0, le=60)
     allowed_destination_ports: str = "80,443"
     require_https_destination: bool = False
     shutdown_timeout_seconds: int = Field(default=20, ge=1, le=120)
@@ -73,6 +82,13 @@ class Settings(BaseSettings):
             raise ValueError("BROWSER_PROXY_SERVER must be a proxy origin without credentials")
         return value.rstrip("/")
 
+    @field_validator("browser_proxy_username", "browser_proxy_password")
+    @classmethod
+    def valid_proxy_credentials(cls, value: str) -> str:
+        if len(value) > 1024 or any(ord(char) < 32 for char in value):
+            raise ValueError("Browser proxy credentials are malformed")
+        return value
+
     @model_validator(mode="after")
     def validate_related_fields(self) -> "Settings":
         if self.playwright_service_token_next and len(self.playwright_service_token_next) < 32:
@@ -83,6 +99,8 @@ class Settings(BaseSettings):
             self.browser_proxy_username or self.browser_proxy_password
         ) and not self.browser_proxy_server:
             raise ValueError("Proxy credentials require BROWSER_PROXY_SERVER")
+        if self.browser_proxy_password and not self.browser_proxy_username:
+            raise ValueError("BROWSER_PROXY_USERNAME is required when a password is configured")
         self.destination_ports
         return self
 
@@ -100,6 +118,8 @@ class Settings(BaseSettings):
 
     @property
     def egress_id(self) -> str:
+        if not self.browser_proxy_server:
+            return "direct"
         raw = "|".join(
             (self.browser_proxy_server, self.browser_proxy_username, self.browser_proxy_password)
         )
@@ -160,7 +180,7 @@ def _transport_cookies(cookies: list[Any], settings: Settings) -> list[dict[str,
             {field: cookie[field] for field in _TRANSPORT_COOKIE_FIELDS if field in cookie}
         )
     if not any(cookie.get("name") == "cf_clearance" for cookie in output):
-        raise HTTPException(502, "Clearance cannot be represented by the transport contract")
+        raise HTTPException(409, "Clearance cannot be represented by the transport contract")
     return output
 
 
@@ -174,7 +194,11 @@ def _is_public_ip(value: str) -> bool:
     return ip.is_global
 
 
-async def _validate_public_url(url: str, settings: Settings | None = None) -> None:
+async def _validate_public_url(
+    url: str,
+    settings: Settings | None = None,
+    resolution_cache: dict[tuple[str, int], float] | None = None,
+) -> None:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().rstrip(".")
     # URL validation is also a standalone/testable primitive; it must not
@@ -206,6 +230,9 @@ async def _validate_public_url(url: str, settings: Settings | None = None) -> No
         if not _is_public_ip(str(literal)):
             raise HTTPException(403, "Private destinations are not allowed")
         return
+    cache_key = (host, port)
+    if resolution_cache is not None and resolution_cache.get(cache_key, 0) > time.monotonic():
+        return
     try:
         records = await asyncio.to_thread(socket.getaddrinfo, host, port, type=socket.SOCK_STREAM)
     except socket.gaierror as exc:
@@ -213,6 +240,8 @@ async def _validate_public_url(url: str, settings: Settings | None = None) -> No
     addresses = {str(record[4][0]).split("%", 1)[0] for record in records}
     if not addresses or not all(_is_public_ip(address) for address in addresses):
         raise HTTPException(403, "Private destinations are not allowed")
+    if resolution_cache is not None:
+        resolution_cache[cache_key] = time.monotonic() + settings.dns_cache_seconds
 
 
 def _authorize(
@@ -283,22 +312,38 @@ class SolveCapacity:
 async def lifespan(app: FastAPI):
     settings = get_settings()
     playwright = await async_playwright().start()
+    smoke_browser = None
+    try:
+        smoke_browser = await playwright.chromium.launch(
+            headless=True,
+            proxy=_proxy_config(settings),
+            args=["--disable-dev-shm-usage"],
+        )
+    except Exception:
+        await playwright.stop()
+        raise
+    finally:
+        if smoke_browser is not None:
+            with suppress(PlaywrightError):
+                await smoke_browser.close()
     app.state.playwright = playwright
     app.state.settings = settings
     app.state.capacity = SolveCapacity(settings.max_concurrent_browsers, settings.max_queue_size)
     app.state.browser_launch_failures = 0
     app.state.shutting_down = False
-    yield
-    app.state.shutting_down = True
-    deadline = time.monotonic() + settings.shutdown_timeout_seconds
-    while app.state.capacity.active and time.monotonic() < deadline:
-        await asyncio.sleep(0.05)
-    await playwright.stop()
+    try:
+        yield
+    finally:
+        app.state.shutting_down = True
+        deadline = time.monotonic() + settings.shutdown_timeout_seconds
+        while app.state.capacity.active and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        await playwright.stop()
 
 
 app = FastAPI(
     title="Cloudflare Playwright Cookie Service",
-    version="1.0.0",
+    version="1.2.0",
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
@@ -308,7 +353,7 @@ app = FastAPI(
 
 @app.exception_handler(HTTPException)
 async def sanitized_http_error(request: Request, exc: HTTPException):
-    request_id = request.headers.get("x-request-id") or uuid4().hex
+    request_id = _request_id(request)
     detail = str(exc.detail) if isinstance(exc.detail, str) else "Request failed"
     if request.url.path == "/solve":
         logger.warning(
@@ -320,7 +365,7 @@ async def sanitized_http_error(request: Request, exc: HTTPException):
     return JSONResponse(
         {"detail": detail, "requestId": request_id},
         status_code=exc.status_code,
-        headers=exc.headers,
+        headers={**(exc.headers or {}), "X-Request-ID": request_id},
     )
 
 
@@ -335,6 +380,9 @@ async def health_ready(request: Request):
         request.app.state, "playwright", None
     ):
         raise HTTPException(503, "Service is not ready")
+    executable = request.app.state.playwright.chromium.executable_path
+    if not executable or not Path(executable).is_file():
+        raise HTTPException(503, "Chromium is not ready")
     return {"status": "ready"}
 
 
@@ -354,12 +402,15 @@ async def service_metrics(request: Request):
     return PlainTextResponse(body)
 
 
-async def _solve_with_browser(url: str, settings: Settings, browser: Browser) -> dict:
+async def _solve_with_browser(
+    url: str, settings: Settings, browser: Browser, request_id: str
+) -> dict:
     state = NavigationState.CREATED
     context = await browser.new_context(service_workers="block")
     page = None
     navigation_count = 0
     initial_scheme = urlparse(url).scheme
+    resolution_cache: dict[tuple[str, int], float] = {}
 
     async def guard_public_requests(route) -> None:
         nonlocal navigation_count
@@ -380,14 +431,14 @@ async def _solve_with_browser(url: str, settings: Settings, browser: Browser) ->
         # browser API does not expose reliable DNS pinning, so this is a
         # mitigation rather than a claim of perfect rebinding prevention.
         try:
-            await _validate_public_url(request_url, settings)
+            await _validate_public_url(request_url, settings, resolution_cache)
         except HTTPException:
             await route.abort("blockedbyclient")
             return
         await route.continue_()
 
-    await context.route("**/*", guard_public_requests)
     try:
+        await context.route("**/*", guard_public_requests)
         page = await context.new_page()
         state = NavigationState.NAVIGATING
         response = await page.goto(
@@ -395,7 +446,7 @@ async def _solve_with_browser(url: str, settings: Settings, browser: Browser) ->
         )
         if response is None:
             raise HTTPException(502, "Browser navigation did not return a response")
-        await _validate_public_url(page.url, settings)
+        await _validate_public_url(page.url, settings, resolution_cache)
         state = NavigationState.WAITING_FOR_CHALLENGE
         deadline = time.monotonic() + settings.solve_timeout_seconds
         cookies: list[Any] = []
@@ -421,7 +472,7 @@ async def _solve_with_browser(url: str, settings: Settings, browser: Browser) ->
         state = NavigationState.COMPLETED
         return {
             "schemaVersion": 1,
-            "requestId": uuid4().hex,
+            "requestId": request_id,
             "cookies": response_cookies,
             "userAgent": user_agent,
             "expiresAt": expires_at,
@@ -438,6 +489,7 @@ async def _solve_with_browser(url: str, settings: Settings, browser: Browser) ->
 @app.post("/solve", dependencies=[Depends(_authorize)])
 async def solve(request: Request):
     settings: Settings = request.app.state.settings
+    request_id = _request_id(request)
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -467,7 +519,7 @@ async def solve(request: Request):
                 request.app.state.browser_launch_failures += 1
                 raise
             return await asyncio.wait_for(
-                _solve_with_browser(url, settings, browser),
+                _solve_with_browser(url, settings, browser, request_id),
                 timeout=settings.solve_timeout_seconds + settings.navigation_timeout_seconds + 5,
             )
         except PlaywrightTimeoutError as exc:

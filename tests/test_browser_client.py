@@ -12,7 +12,9 @@ import pytest
 from cookie_session_core.browser_client import (
     BrowserLikeClient,
     ClearanceCache,
+    RequestBodyTooLarge,
     _looks_like_transient_upstream,
+    _materialize_async_body,
     _parse_retry_after,
 )
 from cookie_session_core.cloudflare_provider import CloudflareCookie, CloudflareCookieResult
@@ -65,6 +67,28 @@ def test_oai_device_rotates_only_after_two_consecutive_failures():
     assert client._record_oai_result(request, 502) is True
     client._rotate_oai_headers(request)
     assert request.headers["oai-device-id"] != stable
+
+
+def test_oai_session_id_remains_stable_while_requests_are_healthy():
+    client = BrowserLikeClient()
+    seen = []
+    for _ in range(6):
+        request = _oai_request("/backend-api/conversations")
+        client._apply_oai_session(request)
+        seen.append(request.headers["oai-session-id"])
+        assert client._record_oai_result(request, 200) is False
+
+    assert len(set(seen)) == 1
+
+
+@pytest.mark.asyncio
+async def test_async_request_body_limit_is_enforced_while_streaming_input():
+    async def chunks():
+        yield b"1234"
+        yield b"5678"
+
+    with pytest.raises(RequestBodyTooLarge):
+        await _materialize_async_body(chunks(), max_bytes=7)
 
 
 @pytest.mark.asyncio
@@ -315,6 +339,6 @@ async def test_non_idempotent_request_is_not_replayed_after_challenge():
     )
     client._send_once = AsyncMock(return_value=(blocked, {}, "example.com"))
 
-    with pytest.raises(httpx.StreamError, match="not safely replayable"):
-        await client.send(request)
+    response = await client.send(request)
+    assert response.status_code == 403
     assert client._send_once.await_count == 1

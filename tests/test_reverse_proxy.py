@@ -8,8 +8,11 @@ from fastapi import HTTPException, Response
 from cookie_session_core.browser_client import _is_sse_request, _is_streaming_request
 from cookie_session_core.core import ConsumedLaunch
 from cookie_session_core.reverse_proxy import (
+    _browser_cookie_namespace,
+    _client_cookie_name,
     _client_cookie_namespace,
     _cookie_header,
+    _decode_client_cookie_name,
     _expire_stale_client_cookies,
     _host_allowed,
     _is_localstorage_sync_path,
@@ -19,6 +22,7 @@ from cookie_session_core.reverse_proxy import (
     _replace_response_header,
     _root_grant_cookie_name,
     _seed_script_visible_cookies,
+    _strip_query_parameter,
     _upstream_cookie_header,
     browser_url,
     challenge_can_be_relayed,
@@ -70,6 +74,27 @@ def test_target_and_cookie_are_scoped_to_upstream():
     assert _cookie_header(item, target) == "session=upstream-secret"
 
 
+def test_internal_launch_parameter_is_removed_without_normalizing_signed_query_bytes():
+    raw = "signature=a%2Fb%2Bc&launch=upstream-value&__cookie_core_launch=secret&blank="
+    assert _strip_query_parameter(raw, "__cookie_core_launch") == (
+        "signature=a%2Fb%2Bc&launch=upstream-value&blank="
+    )
+
+
+def test_allowed_secondary_host_preserves_explicit_nondefault_port():
+    item = launch()
+    assert resolve_target(item, "_host/cdn.example.com:8443/assets/app.js") == (
+        "https://cdn.example.com:8443/assets/app.js"
+    )
+    assert browser_url(
+        "https://cdn.example.com:8443/assets/app.js",
+        current_target="https://app.example.com/",
+        launch=item,
+        proxy_prefix=f"/proxy/{item.service_id}",
+        public_base_url="https://proxy.example.com",
+    ) == f"/proxy/{item.service_id}/_host/cdn.example.com:8443/assets/app.js"
+
+
 def test_forwarded_public_hostname_precedes_docker_upstream_host():
     assert proxy_hostname_candidates(
         {"x-forwarded-host": "Kalodata.JBTools.site:443"},
@@ -83,7 +108,7 @@ def test_only_optional_cloudflare_rum_is_acknowledged_locally():
     assert not _is_optional_telemetry_path("cdn-cgi/challenge-platform/orchestrate")
 
 
-def test_cookie_header_deduplicates_equivalent_leading_dot_domains():
+def test_cookie_header_preserves_host_only_vs_parent_domain_scope():
     item = launch()
     item.cookies.clear()
     item.cookies.extend(
@@ -104,7 +129,8 @@ def test_cookie_header_deduplicates_equivalent_leading_dot_domains():
             },
         ]
     )
-    assert _cookie_header(item, "https://app.example.com/home") == "session=new"
+    assert _cookie_header(item, "https://app.example.com/home") == "session=old"
+    assert _cookie_header(item, "https://example.com/home") == "session=new"
 
 
 def test_cookie_header_prefers_host_specific_cookie_before_parent_cookie():
@@ -297,13 +323,103 @@ def test_launch_seeds_only_script_visible_cookies_matching_current_page():
         secure=True,
     )
     headers = response.headers.getlist("set-cookie")
-    namespace = _client_cookie_namespace(item.service_id)
     assert seeded == 1
-    assert len(headers) == 1
-    assert namespace + "csrf_token=visible-value" in headers[0]
-    assert "private_session" not in headers[0]
-    assert "other_host" not in headers[0]
-    assert "HttpOnly" not in headers[0]
+    assert len(headers) == 2
+    namespace = _browser_cookie_namespace(item.service_id)
+    live = next(header for header in headers if namespace + "v2_" in header)
+    tombstone = next(header for header in headers if namespace + "v2d_" in header)
+    internal_name = live.split("=", 1)[0]
+    assert _decode_client_cookie_name(item.service_id, internal_name) == (
+        "csrf_token",
+        "example.com",
+        "/",
+        False,
+        False,
+    )
+    assert "=visible-value;" in live
+    assert "Max-Age=0" in tombstone
+    assert all("private_session" not in header for header in headers)
+    assert all("other_host" not in header for header in headers)
+    assert all("HttpOnly" not in header for header in headers)
+    assert len(namespace) < len(_client_cookie_namespace(item.service_id))
+
+
+def test_scoped_script_cookies_keep_duplicate_paths_hosts_and_deletions_isolated():
+    item = launch()
+    item.cookies.clear()
+    root = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="example.com",
+        path="/",
+        host_only=False,
+    )
+    admin = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="app.example.com",
+        path="/admin",
+        host_only=True,
+    )
+    sibling = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="cdn.example.com",
+        path="/",
+        host_only=True,
+    )
+    deleted_root = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="example.com",
+        path="/",
+        host_only=False,
+        deleted=True,
+    )
+    browser = {root: "root", admin: "admin", sibling: "cdn"}
+
+    assert _upstream_cookie_header(item, "https://app.example.com/admin/users", browser) == (
+        "state=admin; state=root"
+    )
+    assert _upstream_cookie_header(item, "https://app.example.com/home", browser) == "state=root"
+    assert _upstream_cookie_header(item, "https://cdn.example.com/asset", browser) == (
+        "state=root; state=cdn"
+    )
+
+    browser[deleted_root] = "1"
+    assert _upstream_cookie_header(item, "https://app.example.com/home", browser) == ""
+    assert _upstream_cookie_header(item, "https://app.example.com/admin/users", browser) == (
+        "state=admin"
+    )
+
+
+def test_scoped_cookie_names_round_trip_unicode_and_reject_public_suffix_scope():
+    item = launch()
+    encoded = _client_cookie_name(
+        item.service_id,
+        name="preferencia",
+        domain="app.example.com",
+        path="/usuários",
+        host_only=True,
+    )
+    assert _decode_client_cookie_name(item.service_id, encoded) == (
+        "preferencia",
+        "app.example.com",
+        "/usuários",
+        True,
+        False,
+    )
+    forged = _client_cookie_name(
+        item.service_id,
+        name="preferencia",
+        domain="com",
+        path="/",
+        host_only=False,
+    )
+    item.cookies.clear()
+    assert _upstream_cookie_header(
+        item, "https://app.example.com/", {forged: "must-not-leak"}
+    ) == ""
 
 
 def test_cookie_and_allowlist_paths_use_rfc_boundaries():
@@ -483,7 +599,7 @@ def test_runtime_does_not_intercept_google_identity_gsi():
     assert "if(direct(u))return u.href" in result
 
 
-def test_same_site_apex_and_account_hosts_are_mapped_without_opening_other_sites():
+def test_only_explicit_domains_and_their_subdomains_are_mapped():
     item = launch()
     kwargs = {
         "current_target": "https://app.example.com/home",
@@ -491,10 +607,17 @@ def test_same_site_apex_and_account_hosts_are_mapped_without_opening_other_sites
         "proxy_prefix": f"/proxy/{item.service_id}",
         "public_base_url": "https://servico.jbtools.site",
     }
-    assert _host_allowed("example.com", item.allowed_domains)
-    assert _host_allowed("account.example.com", item.allowed_domains)
+    assert not _host_allowed("example.com", item.allowed_domains)
+    assert not _host_allowed("account.example.com", item.allowed_domains)
     assert not _host_allowed("example.com.attacker.test", item.allowed_domains)
     assert _registrable_domain("app.example.co.uk") == "example.co.uk"
+    assert browser_url("https://account.example.com/profile", **kwargs) == (
+        "https://account.example.com/profile"
+    )
+    explicit = ConsumedLaunch(
+        **{**item.__dict__, "allowed_domains": (*item.allowed_domains, "account.example.com")}
+    )
+    kwargs["launch"] = explicit
     assert browser_url("https://account.example.com/profile", **kwargs) == (
         f"/proxy/{item.service_id}/_host/account.example.com/profile"
     )
@@ -624,7 +747,8 @@ def test_html_urls_and_websocket_runtime_are_rewritten_without_cookie_values():
     assert f'href="/proxy/{item.service_id}/account"' in result
     assert f"wss://servico.jbtools.site/proxy/{item.service_id}/live" in result
     assert "upstream-secret" not in result
-    assert "XMLHttpRequest.prototype.open" in result
+    assert "X-Cookie-Core-Credentials" in result
+    assert "xp.open=function" in result
     assert "http-equiv" not in result
     assert f"/proxy/{item.service_id}/b.png 2x" in result
 
@@ -689,6 +813,78 @@ def test_injected_runtime_is_valid_javascript(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_cookie_runtime_emulates_domain_path_duplicates_and_deletion(tmp_path):
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the document.cookie runtime check")
+    item = launch()
+    prefix = f"/proxy/{item.service_id}"
+    html = rewrite_text(
+        b"<html><head></head></html>",
+        "text/html",
+        current_target="https://app.example.com/admin/panel",
+        launch=item,
+        proxy_prefix=prefix,
+        public_base_url="https://api.jbtools.site",
+        profile_lock_enabled=False,
+    ).decode()
+    runtime = html.split("<script>", 1)[1].split("</script>", 1)[0]
+    root = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="example.com",
+        path="/",
+        host_only=False,
+    )
+    admin = _client_cookie_name(
+        item.service_id,
+        name="state",
+        domain="app.example.com",
+        path="/admin",
+        host_only=True,
+    )
+    sibling = _client_cookie_name(
+        item.service_id,
+        name="cdn_only",
+        domain="cdn.example.com",
+        path="/",
+        host_only=True,
+    )
+    script_path = tmp_path / "cookie-runtime-semantics.js"
+    script_path.write_text(
+        "globalThis.window=globalThis;"
+        f"globalThis.location={{href:'https://api.jbtools.site{prefix}/admin/panel',"
+        f"origin:'https://api.jbtools.site',pathname:'{prefix}/admin/panel'}};"
+        "globalThis.navigator={};globalThis.Element=class Element{};"
+        "Element.prototype.setAttribute=function(){};globalThis.history={pushState(){},replaceState(){}};"
+        "const jar=new Map();globalThis.Document=class Document{};"
+        "Object.defineProperty(Document.prototype,'cookie',{configurable:true,get(){"
+        "return Array.from(jar).map(([k,v])=>k+'='+v).join('; ')},set(v){const parts=v.split(';'),"
+        "i=parts[0].indexOf('='),name=parts[0].slice(0,i),value=parts[0].slice(i+1);"
+        "if(parts.some(x=>/^\\s*max-age=0\\s*$/i.test(x)))jar.delete(name);else jar.set(name,value)}});"
+        "globalThis.document=new Document();"
+        f"jar.set({root!r},'root');jar.set({admin!r},'admin');jar.set({sibling!r},'cdn');"
+        + runtime
+        + "\nif(document.cookie!=='state=admin; state=root')throw new Error('initial scope: '+document.cookie);"
+        "document.cookie='state=changed; Path=/admin';"
+        "if(document.cookie!=='state=changed; state=root')throw new Error('path update: '+document.cookie);"
+        "document.cookie='state=; Path=/admin; Max-Age=0';"
+        "if(document.cookie!=='state=root')throw new Error('delete: '+document.cookie);"
+        f"location.pathname='{prefix}/_host/cdn.example.com/assets/app.js';"
+        "if(document.cookie!=='state=root; cdn_only=cdn')throw new Error('host scope: '+document.cookie);"
+        "if(!Array.from(jar.keys()).some(k=>k.includes('_v2d_')))throw new Error('tombstone missing');",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [node, str(script_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_localstorage_runtime_works_in_transparent_mode_and_syncs_property_writes(tmp_path):
     node = shutil.which("node")
     if not node:
@@ -708,15 +904,19 @@ def test_localstorage_runtime_works_in_transparent_mode_and_syncs_property_write
         public_base_url="https://app.proxy.example",
     ).decode()
     runtime = html.split("<script>", 1)[1].split("</script>", 1)[0]
-    namespace = _client_cookie_namespace(item.service_id) + "store:"
+    cookie_namespace = _client_cookie_namespace(item.service_id)
+    namespace = cookie_namespace + "store:"
+    session_namespace = cookie_namespace + "session:"
     script_path = tmp_path / "localstorage-runtime.js"
     script_path.write_text(
         "class Storage {constructor(){this.data=new Map()} get length(){return this.data.size} "
         "getItem(k){k=String(k);return this.data.has(k)?this.data.get(k):null} "
         "setItem(k,v){this.data.set(String(k),String(v))} removeItem(k){this.data.delete(String(k))} "
         "clear(){this.data.clear()} key(n){return Array.from(this.data.keys())[n]??null}};"
-        "globalThis.Storage=Storage;const nativeLocal=new Storage();const nativeSession=new Storage();"
+        "globalThis.Storage=Storage;const nativeGet=Storage.prototype.getItem;"
+        "const nativeLocal=new Storage();const nativeSession=new Storage();"
         f"nativeLocal.setItem({namespace!r}+'stale','remove-me');"
+        "nativeSession.setItem('temporary','cross-service-leak');"
         "Object.defineProperty(globalThis,'localStorage',{value:nativeLocal,configurable:true});"
         "Object.defineProperty(globalThis,'sessionStorage',{value:nativeSession,configurable:true});"
         "globalThis.window=globalThis;globalThis.location={href:'https://app.proxy.example/',origin:'https://app.proxy.example'};"
@@ -739,6 +939,8 @@ def test_localstorage_runtime_works_in_transparent_mode_and_syncs_property_write
         "Storage.prototype.setItem.call(sessionStorage,'protoSession','yes');"
         "if(Storage.prototype.getItem.call(sessionStorage,'protoSession')!=='yes')throw new Error('session prototype failed');"
         "if(sessionStorage.getItem('temporary')!=='yes')throw new Error('sessionStorage was corrupted');"
+        "if(nativeGet.call(nativeSession,'temporary')!=='cross-service-leak')throw new Error('raw session value changed');"
+        f"if(nativeGet.call(nativeSession,{session_namespace!r}+'temporary')!=='yes')throw new Error('session namespace missing');"
         "setTimeout(function(){if(calls.length!==1)throw new Error('sync not sent');"
         "if(!String(calls[0].url).endsWith('/__localstorage/sync'))throw new Error('wrong transparent sync URL: '+calls[0].url);"
         "const body=JSON.parse(calls[0].init.body);if(body.upserts.theme!=='dark'||body.upserts.viaProto!=='ok')throw new Error('write not synced')},800);",
@@ -1071,6 +1273,13 @@ def test_runtime_uses_history_navigation_without_patching_location_objects():
     assert "rewriteCss" in result, "Dynamic CSS URL rewriting helper must be injected"
     assert "cssUrlRe" in result, "CSS url() regex helper must be present"
     assert "else if(/^style$/i.test(n))v=rewriteCss(v)" in result
+    assert "CSSStyleSheet" in result
+    assert "setAttributeNS" in result
+    assert "data-srcset" in result
+    assert "navigator.locks" in result
+    assert "indexedDB.databases" in result
+    assert "userAgentData',{get(){return undefined" not in result
+    assert "C.credentialsParam+'='+mode" in result
 
 
 def test_chatgpt_profile_menu_is_visibly_locked_and_event_blocked():
@@ -1111,3 +1320,18 @@ def test_profile_lock_policy_is_injected_for_other_products():
     assert "mectrl_main_trigger" in result
     assert "account-menu-button" not in result
     assert "profile-menu-button" not in result
+
+
+def test_profile_lock_can_be_disabled_for_a_false_positive_without_removing_runtime():
+    result = rewrite_text(
+        b"<html><head></head></html>",
+        "text/html",
+        current_target="https://app.example.com/",
+        launch=launch(),
+        proxy_prefix="/proxy/service",
+        public_base_url="https://servico.jbtools.site",
+        profile_lock_enabled=False,
+    ).decode()
+    assert '"profilePrivacy":{"enabled":false' in result
+    assert "window.fetch" in result
+    assert "readVirtualCookies" in result

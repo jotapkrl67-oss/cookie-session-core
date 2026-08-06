@@ -169,6 +169,17 @@ PLAYWRIGHT_SERVICE_TOKEN=<token-gerado>
 CF_AUTO_REFRESH=true
 ```
 
+Se o Playwright usa `BROWSER_PROXY_*`, o core também precisa usar o mesmo proxy
+para HTTP e WebSocket:
+
+```dotenv
+UPSTREAM_PROXY_URL=http://proxy-vps.example.com:3128
+UPSTREAM_PROXY_USERNAME=<usuario>
+UPSTREAM_PROXY_PASSWORD=<senha>
+```
+
+Credenciais embutidas na URL são rejeitadas; mantenha-as nos campos separados.
+
 Configurações existentes reutilizadas:
 
 ```dotenv

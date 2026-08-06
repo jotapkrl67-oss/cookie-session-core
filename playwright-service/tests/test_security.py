@@ -28,7 +28,9 @@ async def test_public_literal_ip_is_allowed():
 
 def test_browser_proxy_configuration_is_optional_and_authenticated():
     base = {"playwright_service_token": "t" * 32}
-    assert _proxy_config(Settings(**base)) is None
+    direct = Settings(**base)
+    assert _proxy_config(direct) is None
+    assert direct.egress_id == "direct"
     assert _proxy_config(
         Settings(
             **base,
@@ -41,3 +43,9 @@ def test_browser_proxy_configuration_is_optional_and_authenticated():
         "username": "user",
         "password": "password",
     }
+    with pytest.raises(ValueError, match="USERNAME"):
+        Settings(
+            **base,
+            browser_proxy_server="http://vps-proxy.example:3128",
+            browser_proxy_password="password-only",
+        )

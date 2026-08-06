@@ -1,11 +1,16 @@
 import json
 import os
+from http.cookies import SimpleCookie
 
 import pytest
 from cryptography.exceptions import InvalidTag
 
 from cookie_session_core.config import Settings
-from cookie_session_core.core import ConsumedLaunch, CookieSessionCore
+from cookie_session_core.core import (
+    ConsumedLaunch,
+    CookieSessionCore,
+    _strip_extended_cookie_attributes,
+)
 from cookie_session_core.models import ServicePolicy
 from cookie_session_core.parser import (
     parse_cookie_import,
@@ -109,6 +114,40 @@ def test_playwright_provider_configuration_rejects_unsafe_or_incomplete_origins(
         )
 
 
+def test_upstream_proxy_configuration_is_validated_and_credentials_are_encoded():
+    values = {
+        "database_url": "postgresql://user:pass@localhost/test",
+        "supabase_url": "https://example.supabase.co",
+        "supabase_publishable_key": "x" * 32,
+        "cookie_vault_key_base64": "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=",
+        "launch_token_pepper_base64": "eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHg=",
+        "admin_proxy_secret": "a" * 32,
+        "public_base_url": "https://proxy.example.com",
+        "allowed_origins": "https://app.example.com",
+    }
+    direct = Settings(**values)
+    assert direct.egress_id == "direct"
+    assert direct.httpx_proxy_url is None
+
+    proxied = Settings(
+        **values,
+        upstream_proxy_url="http://proxy.example.com:3128",
+        upstream_proxy_username="user@example.com",
+        upstream_proxy_password="p:a/ss",
+    )
+    assert proxied.httpx_proxy_url == (
+        "http://user%40example.com:p%3Aa%2Fss@proxy.example.com:3128"
+    )
+    assert proxied.egress_id != "direct"
+
+    with pytest.raises(ValueError, match="USERNAME"):
+        Settings(
+            **values,
+            upstream_proxy_url="http://proxy.example.com:3128",
+            upstream_proxy_password="password-only",
+        )
+
+
 def test_devtools_table_and_policy():
     raw = "session\tsecret\t.example.com\t/\t2027-01-01T00:00:00Z\t20\t✓\t✓\tLax"
     cookie = parse_cookie_import(raw, "example.com")[0]
@@ -148,6 +187,36 @@ def test_vault_is_bound_to_user_service_and_name():
 def test_cookie_header():
     cookies = parse_cookie_import("session=abc; theme=dark", "example.com")
     assert [item.name for item in cookies] == ["session", "theme"]
+
+
+def test_json_cookie_booleans_and_host_only_semantics_are_preserved():
+    cookies = parse_cookie_import(
+        '[{"name":"host","value":"a","domain":"app.example.com",'
+        '"secure":"false","httpOnly":"false"},'
+        '{"name":"parent","value":"b","domain":".example.com"},'
+        '{"name":"explicit","value":"c","domain":"example.com","hostOnly":false}]',
+        "example.com",
+    )
+
+    assert cookies[0].host_only is True
+    assert cookies[0].secure is False
+    assert cookies[0].http_only is False
+    assert cookies[1].host_only is False
+    assert cookies[2].host_only is False
+
+
+def test_extended_set_cookie_attributes_are_removed_without_corrupting_quoted_values():
+    cleaned = _strip_extended_cookie_attributes(
+        'session="value;still-value"; Path=/; Secure; HttpOnly; '
+        "Priority=High; Partitioned; SameParty"
+    )
+    parsed = SimpleCookie()
+    parsed.load(cleaned)
+
+    assert parsed["session"].value == "value;still-value"
+    assert parsed["session"]["secure"] is True
+    assert "Priority" not in cleaned
+    assert "Partitioned" not in cleaned
 
 
 def test_localstorage_import_preserves_real_web_storage_keys_and_values():

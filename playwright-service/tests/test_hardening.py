@@ -103,6 +103,24 @@ def test_transport_contract_drops_partitioned_and_unknown_cookie_fields():
     assert "unexpectedBrowserField" not in result[0]
 
 
+def test_partitioned_clearance_is_a_permanent_contract_error():
+    settings = Settings(playwright_service_token="t" * 32)
+    with pytest.raises(HTTPException) as exc:
+        _transport_cookies(
+            [
+                {
+                    "name": "cf_clearance",
+                    "value": "partition-bound",
+                    "domain": ".example.com",
+                    "path": "/",
+                    "partitionKey": "https://example.com",
+                }
+            ],
+            settings,
+        )
+    assert exc.value.status_code == 409
+
+
 @pytest.mark.asyncio
 async def test_solve_error_response_is_sanitized(caplog):
     scope = {
@@ -123,3 +141,24 @@ async def test_solve_error_response_is_sanitized(caplog):
     assert response.status_code == 502
     assert b'"detail":"Browser operation failed"' in response.body
     assert "Browser operation failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_solve_error_replaces_log_forging_request_id():
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/solve",
+        "headers": [(b"x-request-id", b"bad id with spaces")],
+        "query_string": b"",
+        "server": ("test", 443),
+        "client": ("127.0.0.1", 1),
+        "scheme": "https",
+    }
+    response = await sanitized_http_error(
+        Request(scope), HTTPException(502, "Browser operation failed")
+    )
+
+    request_id = response.headers["x-request-id"]
+    assert len(request_id) == 32
+    assert request_id != "bad id with spaces"
