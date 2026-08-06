@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
+import logging
 from dataclasses import dataclass
 
 import httpx
 import jwt
 from fastapi import Depends, Header, HTTPException, Request
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError
 
 from .config import Settings
+from .redaction import install_redaction
+
+logger = logging.getLogger("cookie_session_core.auth")
+install_redaction(logger)
+
+
+def _subject_fingerprint(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()[:12]
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,7 @@ class SupabaseJWTVerifier:
             f"{self.issuer}/.well-known/jwks.json",
             cache_keys=True,
             lifespan=600,
+            timeout=float(settings.supabase_jwks_timeout_seconds),
         )
 
     async def verify(self, token: str) -> AuthenticatedUser:
@@ -52,6 +64,8 @@ class SupabaseJWTVerifier:
                 raise HTTPException(401, "Unsupported authentication token")
         except HTTPException:
             raise
+        except PyJWKClientConnectionError as exc:
+            raise HTTPException(503, "Authentication service is temporarily unavailable") from exc
         except (jwt.PyJWTError, httpx.HTTPError, KeyError, ValueError):
             raise HTTPException(401, "Invalid or expired authentication")
         subject = str(claims.get("sub") or claims.get("id") or "")
@@ -64,19 +78,28 @@ class SupabaseJWTVerifier:
         )
 
     async def _verify_legacy_token(self, token: str) -> dict:
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(
-                f"{self.issuer}/user",
-                headers={
-                    "apikey": self.settings.supabase_publishable_key,
-                    "Authorization": f"Bearer {token}",
-                },
-            )
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.get(
+                    f"{self.issuer}/user",
+                    headers={
+                        "apikey": self.settings.supabase_publishable_key,
+                        "Authorization": f"Bearer {token}",
+                    },
+                )
+        except httpx.HTTPError as exc:
+            raise HTTPException(503, "Authentication service is temporarily unavailable") from exc
+        if response.status_code == 429 or response.status_code >= 500:
+            raise HTTPException(503, "Authentication service is temporarily unavailable")
         if response.status_code != 200:
             raise HTTPException(401, "Invalid or expired authentication")
-        user = response.json()
+        try:
+            user = response.json()
+            subject = str(user["id"])
+        except (ValueError, KeyError, TypeError) as exc:
+            raise HTTPException(503, "Authentication service returned an invalid response") from exc
         return {
-            "sub": user["id"],
+            "sub": subject,
             "email": user.get("email"),
             "app_metadata": user.get("app_metadata") or {},
             "user_metadata": user.get("user_metadata") or {},
@@ -84,11 +107,33 @@ class SupabaseJWTVerifier:
 
 
 async def current_user(request: Request, authorization: str | None = Header(default=None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Authentication required")
-    return await request.app.state.jwt_verifier.verify(
-        authorization.removeprefix("Bearer ").strip()
+    client_host = request.client.host if request.client else "unknown"
+    request.app.state.rate_limiter.check(
+        "auth", client_host, request.app.state.settings.auth_rate_limit_per_minute
     )
+    scheme, separator, token = (authorization or "").partition(" ")
+    if not separator or scheme.casefold() != "bearer" or not token.strip():
+        logger.warning(
+            "authentication_failed request_id=%s path=%s reason=missing_bearer",
+            getattr(request.state, "request_id", "unknown"),
+            request.url.path,
+        )
+        raise HTTPException(401, "Authentication required")
+    try:
+        user = await request.app.state.jwt_verifier.verify(
+            token.strip()
+        )
+    except HTTPException as exc:
+        logger.warning(
+            "authentication_failed request_id=%s path=%s status=%s reason=%s",
+            getattr(request.state, "request_id", "unknown"),
+            request.url.path,
+            exc.status_code,
+            exc.detail,
+        )
+        raise
+    request.state.user_fingerprint = _subject_fingerprint(user.id)
+    return user
 
 
 async def current_admin(
@@ -100,5 +145,11 @@ async def current_admin(
     if not x_cookie_core_admin or not hmac.compare_digest(
         x_cookie_core_admin.encode(), expected.encode()
     ):
+        logger.warning(
+            "authorization_failed request_id=%s path=%s user=%s reason=admin_secret",
+            getattr(request.state, "request_id", "unknown"),
+            request.url.path,
+            _subject_fingerprint(user.id),
+        )
         raise HTTPException(403, "Administrator permission required")
     return user

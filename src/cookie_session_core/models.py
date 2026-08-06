@@ -25,6 +25,7 @@ class ImportedCookie:
     secure: bool = True
     http_only: bool = True
     same_site: str | None = None
+    host_only: bool = True
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class StoredCookie:
     secure: bool
     http_only: bool
     same_site: str | None
+    host_only: bool = True
 
 
 @dataclass(frozen=True)

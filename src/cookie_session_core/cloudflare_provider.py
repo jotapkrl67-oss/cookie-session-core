@@ -6,6 +6,7 @@ import math
 import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Protocol, runtime_checkable
@@ -190,18 +191,20 @@ class HttpCloudflareCookieProvider:
         return "open" if time.monotonic() < self._circuit_open_until else "closed"
 
     async def _solve_with_retry(self, url: str) -> CloudflareCookieResult:
-        correlation_id = httpx.Request("GET", url).headers.get("x-request-id")
+        correlation_id = uuid.uuid4().hex
         for attempt in range(self._max_retries + 1):
             try:
-                response = await self._http.post(
+                request = self._http.build_request(
+                    "POST",
                     self._endpoint,
                     json={"url": url},
                     headers={
                         "Authorization": f"Bearer {self._token}",
                         "Accept": "application/json",
-                        **({"X-Correlation-ID": correlation_id} if correlation_id else {}),
+                        "X-Request-ID": correlation_id,
                     },
                 )
+                response = await self._http.send(request, stream=True)
             except httpx.TimeoutException as exc:
                 error: CloudflareCookieProviderError = CloudflareProviderTimeoutError(
                     "Playwright service timed out"
@@ -217,35 +220,42 @@ class HttpCloudflareCookieProvider:
                     continue
                 raise error from exc
 
-            if response.status_code in {401, 403}:
-                raise CloudflareProviderAuthenticationError(
-                    "Playwright service rejected credentials"
-                )
-            if response.status_code in {400, 404, 409, 422}:
-                raise CloudflareProviderValidationError("Playwright service rejected the request")
-            if response.status_code in {408, 504}:
-                error = CloudflareProviderTimeoutError("Playwright solve timed out")
-            elif response.status_code in {429, 502, 503}:
-                error = CloudflareProviderUnavailableError(
-                    "Playwright service is temporarily unavailable"
-                )
-            elif response.status_code != 200:
-                raise CloudflareProviderProtocolError(
-                    "Playwright service returned an unexpected status"
-                )
-            else:
-                content = response.content
-                if len(content) > self._max_response_bytes:
-                    raise CloudflareProviderProtocolError(
-                        "Playwright response exceeded the size limit"
+            try:
+                if response.status_code in {401, 403}:
+                    raise CloudflareProviderAuthenticationError(
+                        "Playwright service rejected credentials"
                     )
-                try:
-                    payload = response.json()
-                except ValueError as exc:
+                if response.status_code in {400, 404, 409, 422}:
+                    raise CloudflareProviderValidationError(
+                        "Playwright service rejected the request"
+                    )
+                if response.status_code in {408, 504}:
+                    error = CloudflareProviderTimeoutError("Playwright solve timed out")
+                elif response.status_code in {429, 502, 503}:
+                    error = CloudflareProviderUnavailableError(
+                        "Playwright service is temporarily unavailable"
+                    )
+                elif response.status_code != 200:
                     raise CloudflareProviderProtocolError(
-                        "Playwright service returned invalid JSON"
-                    ) from exc
-                return self._parse_result(payload, requested_url=url)
+                        "Playwright service returned an unexpected status"
+                    )
+                else:
+                    content = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        content.extend(chunk)
+                        if len(content) > self._max_response_bytes:
+                            raise CloudflareProviderProtocolError(
+                                "Playwright response exceeded the size limit"
+                            )
+                    try:
+                        payload = httpx.Response(200, content=bytes(content)).json()
+                    except ValueError as exc:
+                        raise CloudflareProviderProtocolError(
+                            "Playwright service returned invalid JSON"
+                        ) from exc
+                    return self._parse_result(payload, requested_url=url)
+            finally:
+                await response.aclose()
             if attempt < self._max_retries:
                 await asyncio.sleep(min(0.25 * 2**attempt, 1.0))
                 continue

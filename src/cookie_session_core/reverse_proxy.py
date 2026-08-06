@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
 import re
@@ -10,7 +12,7 @@ from contextlib import suppress
 from datetime import datetime
 from html import escape
 from typing import Any, Protocol, cast
-from urllib.parse import quote, unquote, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import unquote, unquote_plus, urljoin, urlparse, urlunparse
 
 import httpx
 from fastapi import HTTPException, Request, WebSocket
@@ -19,8 +21,10 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import WebSocketException
 from websockets.typing import Origin, Subprotocol
 
-from .browser_client import _is_streaming_request
-from .core import ConsumedLaunch, CookieSessionCore
+from .browser_client import RequestBodyTooLarge, _is_streaming_request
+from .core import CapturedCookie, ConsumedLaunch, CookieSessionCore
+from .egress import PublicAddressGuard
+from .parser import DEFAULT_BLOCKED_PUBLIC_SUFFIXES
 from .redaction import install_redaction
 
 logger = logging.getLogger("cookie_session_core.reverse_proxy")
@@ -166,6 +170,9 @@ PROFILE_LOCK_SELECTORS = (
     'a[href*="myaccount.google.com"]',
     'a[href*="accounts.google.com/SignOutOptions"]',
 )
+LAUNCH_QUERY_PARAM = "__cookie_core_launch"
+LEGACY_LAUNCH_QUERY_PARAM = "launch"
+CREDENTIALS_QUERY_PARAM = "__cookie_core_credentials"
 MIME_OVERRIDE_BY_EXTENSION = {
     ".js": "application/javascript; charset=utf-8",
     ".mjs": "application/javascript; charset=utf-8",
@@ -188,12 +195,16 @@ MIME_OVERRIDE_BY_EXTENSION = {
     ".htm": "text/html; charset=utf-8",
 }
 URL_ATTRIBUTE = re.compile(
-    r"(?P<prefix>\b(?:href|src|action|poster|data|formaction)\s*=\s*)"
+    r"(?P<prefix>\b(?:href|src|action|poster|data|formaction|xlink:href|cite|longdesc|"
+    r"background|codebase|manifest|data-src|data-lazy-src|data-original|data-href|"
+    r"data-url|data-poster|data-background)\s*=\s*)"
     r"(?P<quote>['\"])(?P<url>.*?)(?P=quote)",
     re.IGNORECASE | re.DOTALL,
 )
 UNQUOTED_URL_ATTRIBUTE = re.compile(
-    r"(?P<prefix>\b(?:href|src|action|poster|data|formaction)\s*=\s*)"
+    r"(?P<prefix>\b(?:href|src|action|poster|data|formaction|xlink:href|cite|longdesc|"
+    r"background|codebase|manifest|data-src|data-lazy-src|data-original|data-href|"
+    r"data-url|data-poster|data-background)\s*=\s*)"
     r"(?!['\"])(?P<url>[^\s>]+)",
     re.IGNORECASE,
 )
@@ -207,7 +218,8 @@ CSS_IMPORT = re.compile(
     re.IGNORECASE,
 )
 SRCSET_ATTRIBUTE = re.compile(
-    r"(?P<prefix>\bsrcset\s*=\s*)(?P<quote>['\"])(?P<value>.*?)(?P=quote)",
+    r"(?P<prefix>\b(?:srcset|imagesrcset|data-srcset)\s*=\s*)"
+    r"(?P<quote>['\"])(?P<value>.*?)(?P=quote)",
     re.IGNORECASE | re.DOTALL,
 )
 META_CSP = re.compile(
@@ -249,15 +261,10 @@ INTEGRITY_ATTRIBUTE = re.compile(
 
 def _host_allowed(host: str, allowed: tuple[str, ...]) -> bool:
     normalized = host.lower().rstrip(".")
-    if any(
+    return any(
         normalized == item.lower().lstrip(".").rstrip(".")
         or normalized.endswith("." + item.lower().lstrip(".").rstrip("."))
         for item in allowed
-    ):
-        return True
-    site = _registrable_domain(normalized)
-    return "." in site and any(
-        _registrable_domain(item.lower().lstrip(".").rstrip(".")) == site for item in allowed
     )
 
 
@@ -357,12 +364,16 @@ def _matching_cookies(launch: ConsumedLaunch, target: str) -> list[dict]:
     path = parsed.path or "/"
     selected: dict[tuple[str, str, str], dict] = {}
     for cookie in launch.cookies:
-        domain = str(cookie["domain"]).lower().lstrip(".")
+        raw_domain = str(cookie["domain"]).lower().rstrip(".")
+        domain = raw_domain.lstrip(".")
+        host_only = bool(cookie.get("hostOnly", not raw_domain.startswith(".")))
         # Preserve the browser's real cookie scope. A host-only cookie for
         # account.example.com must never be sent to api.example.com merely
         # because both hosts share an eTLD+1; duplicate session names can make
         # SSR appear logged out while a later client request looks authenticated.
-        if host != domain and not host.endswith("." + domain):
+        if (host_only and host != domain) or (
+            not host_only and host != domain and not host.endswith("." + domain)
+        ):
             continue
         cookie_path = str(cookie.get("path") or "/")
         # RFC 6265 path-match: /admin matches /admin and /admin/x, not
@@ -399,7 +410,86 @@ def _cookie_header(launch: ConsumedLaunch, target: str) -> str:
 
 
 def _client_cookie_namespace(service_id: str) -> str:
+    """Legacy namespace retained for storage isolation and v1 browser cookies."""
     return f"__Secure-cookie_core_client_{service_id}_"
+
+
+def _browser_cookie_namespace(service_id: str) -> str:
+    """Compact namespace that keeps large browser Cookie headers manageable."""
+    service_hash = hashlib.sha256(service_id.encode()).hexdigest()[:16]
+    return f"__Secure-cc_{service_hash}_"
+
+
+def _client_cookie_name(
+    service_id: str,
+    *,
+    name: str,
+    domain: str,
+    path: str,
+    host_only: bool,
+    deleted: bool = False,
+) -> str:
+    """Encode upstream cookie identity into one collision-free browser name."""
+    payload = json.dumps(
+        [1 if host_only else 0, domain.lower().strip("."), path or "/", name],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    version = "v2d_" if deleted else "v2_"
+    return _browser_cookie_namespace(service_id) + version + encoded
+
+
+def _decode_client_cookie_name(
+    service_id: str, raw_name: str
+) -> tuple[str, str, str, bool, bool] | None:
+    namespaces = (_browser_cookie_namespace(service_id), _client_cookie_namespace(service_id))
+    namespace = next((item for item in namespaces if raw_name.startswith(item)), None)
+    if namespace is None:
+        return None
+    remainder = raw_name[len(namespace) :]
+    deleted = remainder.startswith("v2d_")
+    if not deleted and not remainder.startswith("v2_"):
+        return None
+    encoded = remainder[4:] if deleted else remainder[3:]
+    if not encoded or len(encoded) > 2048:
+        return None
+    try:
+        padded = encoded + "=" * (-len(encoded) % 4)
+        decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(decoded, list) or len(decoded) != 4:
+        return None
+    host_flag, domain, path, name = decoded
+    if (
+        host_flag not in {0, 1}
+        or not isinstance(domain, str)
+        or not isinstance(path, str)
+        or not isinstance(name, str)
+        or not domain
+        or len(domain) > 253
+        or not path.startswith("/")
+        or len(path) > 500
+        or not name
+        or len(name) > 250
+        or any(char in name for char in " \t\r\n;,=")
+    ):
+        return None
+    return name, domain.lower().strip("."), path, bool(host_flag), deleted
+
+
+def _cookie_scope_matches(
+    *, host: str, request_path: str, domain: str, cookie_path: str, host_only: bool
+) -> bool:
+    domain = domain.lower().strip(".")
+    domain_matches = host == domain if host_only else host == domain or host.endswith("." + domain)
+    path_matches = (
+        request_path == cookie_path
+        or request_path.startswith(cookie_path.rstrip("/") + "/")
+        or cookie_path == "/"
+    )
+    return domain_matches and path_matches
 
 
 def _root_grant_cookie_name(service_id: str) -> str:
@@ -455,11 +545,11 @@ def _expire_stale_client_cookies(
     winning after a new launch, even when the administrator imported valid
     cookies into the vault.
     """
-    namespace = _client_cookie_namespace(service_id)
+    namespaces = (_browser_cookie_namespace(service_id), _client_cookie_namespace(service_id))
     cookie_paths = {"/", proxy_prefix + "/"}
     expired = 0
     for raw_name in browser_cookies:
-        if not raw_name.startswith(namespace):
+        if not raw_name.startswith(namespaces):
             continue
         expired += 1
         for cookie_path in cookie_paths:
@@ -486,18 +576,57 @@ def _seed_script_visible_cookies(
     them exclusively in the server vault breaks CSRF and client-state logic,
     leaving authenticated pages visible but their actions non-functional.
     """
-    namespace = _client_cookie_namespace(launch.service_id)
     seeded = 0
-    visible: dict[str, dict] = {}
+    visible: dict[tuple[str, str, str], dict] = {}
     for cookie in _matching_cookies(launch, target):
         if bool(cookie.get("httpOnly", True)):
             continue
-        visible.setdefault(str(cookie["name"]), cookie)
+        key = (
+            str(cookie["name"]),
+            str(cookie["domain"]).lower().strip("."),
+            str(cookie.get("path") or "/"),
+        )
+        existing = visible.get(key)
+        if existing is None or _cookie_recency(cookie) >= _cookie_recency(existing):
+            visible[key] = cookie
 
     for cookie in visible.values():
+        value = str(cookie["value"])
+        raw_domain = str(cookie["domain"]).lower().rstrip(".")
+        internal_name = _client_cookie_name(
+            launch.service_id,
+            name=str(cookie["name"]),
+            domain=raw_domain,
+            path=str(cookie.get("path") or "/"),
+            host_only=bool(cookie.get("hostOnly", not raw_domain.startswith("."))),
+        )
+        tombstone_name = _client_cookie_name(
+            launch.service_id,
+            name=str(cookie["name"]),
+            domain=raw_domain,
+            path=str(cookie.get("path") or "/"),
+            host_only=bool(cookie.get("hostOnly", not raw_domain.startswith("."))),
+            deleted=True,
+        )
+        # Browsers reject an oversized Set-Cookie field. Skipping a value that
+        # cannot be represented is safer than invalidating every response
+        # header and the HttpOnly grant that accompanies it.
+        if len((internal_name + value).encode()) > 3800:
+            logger.warning(
+                "Skipping oversized script-visible cookie service_id=%s name=%s",
+                launch.service_id,
+                str(cookie["name"])[:100],
+            )
+            continue
+        response.delete_cookie(
+            tombstone_name,
+            path=proxy_prefix + "/",
+            secure=secure,
+            samesite="lax",
+        )
         response.set_cookie(
-            namespace + quote(str(cookie["name"]), safe=""),
-            str(cookie["value"]),
+            internal_name,
+            value,
             secure=secure,
             httponly=False,
             samesite="lax",
@@ -514,12 +643,51 @@ def _upstream_cookie_header(
 
     Upstream Set-Cookie values never enter this jar; they remain in the vault.
     """
-    namespace = _client_cookie_namespace(launch.service_id)
-    client_values: dict[str, str] = {}
+    browser_namespace = _browser_cookie_namespace(launch.service_id)
+    legacy_namespace = _client_cookie_namespace(launch.service_id)
+    target_url = urlparse(target)
+    target_host = (target_url.hostname or "").lower()
+    target_path = target_url.path or "/"
+    scoped_values: dict[tuple[str, str, str], tuple[str, int]] = {}
+    deleted_scopes: set[tuple[str, str, str]] = set()
+    legacy_values: dict[str, str] = {}
     for raw_name, value in browser_cookies.items():
-        if not raw_name.startswith(namespace):
+        if not raw_name.startswith((browser_namespace, legacy_namespace)):
             continue
-        name = unquote(raw_name[len(namespace) :])
+        decoded = _decode_client_cookie_name(launch.service_id, raw_name)
+        if decoded is not None:
+            name, domain, path, host_only, deleted = decoded
+            if domain in (DEFAULT_BLOCKED_PUBLIC_SUFFIXES | PRIVATE_HOSTING_SUFFIXES) or (
+                launch.allowed_cookie_names and name not in launch.allowed_cookie_names
+            ):
+                continue
+            if not _cookie_scope_matches(
+                host=target_host,
+                request_path=target_path,
+                domain=domain,
+                cookie_path=path,
+                host_only=host_only,
+            ):
+                continue
+            key = (name, domain, path)
+            if deleted:
+                deleted_scopes.add(key)
+                scoped_values.pop(key, None)
+            elif key not in deleted_scopes and not any(char in value for char in "\r\n;"):
+                scoped_values[key] = (value, len(path))
+            continue
+
+        # Backward compatibility for browser cookies issued by core 1.1 and
+        # earlier. They have no domain/path identity and are replaced naturally
+        # by v2 cookies on the next launch/rotation.
+        if raw_name.startswith(browser_namespace):
+            # Compact browser names were introduced with the scoped v2 format;
+            # malformed values must not silently turn into logical cookies.
+            continue
+        remainder = raw_name[len(legacy_namespace) :]
+        if remainder.startswith(("v2_", "v2d_")):
+            continue
+        name = unquote(remainder)
         if (
             not name
             or len(name) > 250
@@ -528,16 +696,36 @@ def _upstream_cookie_header(
             or (launch.allowed_cookie_names and name not in launch.allowed_cookie_names)
         ):
             continue
-        client_values[name] = value
+        legacy_values[name] = value
 
-    stored = _cookie_header(launch, target)
-    stored_parts = []
-    for item in stored.split("; ") if stored else []:
-        name = item.split("=", 1)[0]
-        if name not in client_values:
-            stored_parts.append(item)
-    stored_parts.extend(f"{name}={value}" for name, value in client_values.items())
-    return "; ".join(stored_parts)
+    output: list[tuple[str, str, int]] = []
+    consumed_scopes: set[tuple[str, str, str]] = set()
+    for cookie in _matching_cookies(launch, target):
+        name = str(cookie["name"])
+        key = (
+            name,
+            str(cookie["domain"]).lower().strip("."),
+            str(cookie.get("path") or "/"),
+        )
+        consumed_scopes.add(key)
+        if key in deleted_scopes:
+            continue
+        if key in scoped_values:
+            value, specificity = scoped_values[key]
+        elif name in legacy_values:
+            value, specificity = legacy_values[name], len(key[2])
+        else:
+            value, specificity = str(cookie["value"]), len(key[2])
+        output.append((name, value, specificity))
+
+    for key, (value, specificity) in scoped_values.items():
+        if key not in consumed_scopes:
+            output.append((key[0], value, specificity))
+    for name, value in legacy_values.items():
+        if not any(item[0] == name for item in output):
+            output.append((name, value, 0))
+    output.sort(key=lambda item: item[2], reverse=True)
+    return "; ".join(f"{name}={value}" for name, value, _specificity in output)
 
 
 def _path_allowed(path: str, allowed: tuple[str, ...]) -> bool:
@@ -579,15 +767,67 @@ def _is_localstorage_sync_path(path: str) -> bool:
     return path.strip("/") == "__localstorage/sync"
 
 
+def _is_client_error_path(path: str) -> bool:
+    """Match the proxy-owned browser diagnostics receiver."""
+    return path.strip("/") == "__diagnostics/client-error"
+
+
+def _diagnostic_text(value: object, maximum: int) -> str:
+    """Bound browser-controlled log fields and remove log-forging controls."""
+    return " ".join(str(value or "").replace("\x00", "").split())[:maximum]
+
+
+def _strip_query_parameter(raw_query: str, name: str) -> str:
+    """Remove one internal key without normalizing signed/opaque query bytes."""
+    kept: list[str] = []
+    for segment in raw_query.split("&"):
+        raw_key = segment.partition("=")[0]
+        try:
+            key = unquote_plus(raw_key)
+        except Exception:
+            key = raw_key
+        if key != name:
+            kept.append(segment)
+    return "&".join(kept)
+
+
+def _raw_request_path(request: Request, service_id: str, path: str, *, transparent: bool) -> str:
+    raw = request.scope.get("raw_path")
+    if not isinstance(raw, bytes):
+        return path
+    raw_path = raw.decode("latin-1")
+    if transparent:
+        return raw_path.lstrip("/")
+    marker = f"/proxy/{service_id}/"
+    if raw_path.startswith(marker):
+        return raw_path[len(marker) :]
+    return path
+
+
+def _target_authority(value: str) -> tuple[str, str] | None:
+    try:
+        parsed = urlparse("//" + value)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if not host or parsed.username or parsed.password:
+        return None
+    authority = f"{host}:{port}" if port is not None else host
+    return host, authority
+
+
 def resolve_target(launch: ConsumedLaunch, path: str, query: str = "") -> str:
     """Maps a proxy path to one allowlisted HTTPS upstream URL."""
     upstream = urlparse(launch.upstream_url)
     if path.startswith("_host/"):
         parts = path.split("/", 2)
-        if len(parts) < 2 or not _host_allowed(parts[1], launch.allowed_domains):
+        target_authority = _target_authority(parts[1]) if len(parts) >= 2 else None
+        if not target_authority or not _host_allowed(
+            target_authority[0], launch.allowed_domains
+        ):
             raise HTTPException(403, "Proxy destination is not allowed")
-        host = parts[1].lower()
-        netloc = host
+        host, netloc = target_authority
         target_path = "/" + (parts[2] if len(parts) == 3 else "")
     else:
         host = (upstream.hostname or "").lower()
@@ -626,7 +866,14 @@ def browser_url(
     if not _host_allowed(host, launch.allowed_domains):
         return raw_url
     main_host = (urlparse(launch.upstream_url).hostname or "").lower()
-    host_part = "" if host == main_host else f"/_host/{host}"
+    try:
+        port = parsed.port
+    except ValueError:
+        return raw_url
+    authority = f"{host}:{port}" if port is not None and port not in {80, 443} else host
+    main = urlparse(launch.upstream_url)
+    same_authority = host == main_host and (port or 443) == (main.port or 443)
+    host_part = "" if same_authority else f"/_host/{authority}"
     proxied_path = f"{proxy_prefix}{host_part}{parsed.path or '/'}"
     if parsed.query:
         proxied_path += "?" + parsed.query
@@ -638,7 +885,13 @@ def browser_url(
     return proxied_path
 
 
-def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -> str:
+def _runtime_script(
+    launch: ConsumedLaunch,
+    prefix: str,
+    public_base_url: str,
+    *,
+    profile_lock_enabled: bool = True,
+) -> str:
     hosts = [item.lower().lstrip(".") for item in launch.allowed_domains]
     payload = json.dumps(
         {
@@ -646,14 +899,19 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
             "proxyOrigin": public_base_url.rstrip("/"),
             "hosts": hosts,
             "cookieNamespace": _client_cookie_namespace(launch.service_id),
+            "browserCookieNamespace": _browser_cookie_namespace(launch.service_id),
+            "credentialsParam": CREDENTIALS_QUERY_PARAM,
             "directBrowserPaths": DIRECT_BROWSER_PATHS,
             "directBrowserHosts": list(DIRECT_BROWSER_HOSTS),
             "directAssetHosts": list(DIRECT_PUBLIC_ASSET_HOSTS),
             "directAssetSuffixes": list(DIRECT_PUBLIC_ASSET_SUFFIXES),
             "profilePrivacy": {
-                "enabled": True,
+                "enabled": profile_lock_enabled,
                 "selectors": PROFILE_LOCK_SELECTORS,
             },
+            "blockedCookieDomains": sorted(
+                DEFAULT_BLOCKED_PUBLIC_SUFFIXES | PRIVATE_HOSTING_SUFFIXES
+            ),
             "upstreamOrigin": _url_origin(launch.upstream_url),
             "localStorage": launch.local_storage_items,
         },
@@ -664,10 +922,7 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "<script>(function(){"
         f"const C={payload};"
         "if(typeof window.process==='undefined')window.process={env:{NODE_ENV:'production'}};"
-        "const site=h=>{const p=h.toLowerCase().replace(/\\.$/,'').split('.');"
-        "const s=new Set(['ac','co','com','edu','gov','net','org']);"
-        "return p.length>2&&p.at(-1).length===2&&s.has(p.at(-2))?p.slice(-3).join('.'):p.slice(-2).join('.')};"
-        "const ok=h=>C.hosts.some(x=>h===x||h.endsWith('.'+x)||site(h)===site(x));"
+        "const ok=h=>{h=h.toLowerCase().replace(/\\.$/,'');return C.hosts.some(x=>h===x||h.endsWith('.'+x))};"
         "const direct=u=>C.directBrowserHosts.indexOf(u.hostname.toLowerCase())>=0||"
         "C.directBrowserPaths.some(([h,p])=>u.hostname===h&&"
         "(u.pathname===p.replace(/\\/$/,'')||u.pathname.startsWith(p)));"
@@ -682,28 +937,43 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "if(!u.pathname.startsWith(C.prefix))u.pathname=C.prefix+u.pathname;}"
         "else if(assetHost(u.hostname)){return u.href;}"
         "else if(ok(u.hostname)){"
-        f"const main=new URL({upstream_json}).hostname;const h=u.hostname;"
+        f"const mainUrl=new URL({upstream_json}),main=mainUrl.hostname;const h=u.hostname;"
+        "const origPort=u.port,authority=origPort?h+':'+origPort:h;"
         "u.protocol=ws?'wss:':'https:';u.host=new URL(C.proxyOrigin).host;"
-        "u.pathname=C.prefix+(h===main?'':'/_host/'+h)+u.pathname;}"
+        "u.pathname=C.prefix+(h===main&&origPort===mainUrl.port?'':'/_host/'+authority)+u.pathname;}"
         "return ws?u.href.replace(/^https:/,'wss:'):u.href;}catch(_e){return v;}};"
         "try{Object.defineProperty(window,'__cookieCoreMappedOrigin',{"
         "value:C.upstreamOrigin,writable:false,configurable:true});}catch(_e){}"
-        "try{const orig=Object.getOwnPropertyDescriptor(navigator,'userAgent');"
-        "if(!orig||orig.configurable){Object.defineProperty(navigator,'userAgentData',{get(){return undefined},configurable:true});}}"
-        "catch(_e){}"
-        "const f=window.fetch;if(f)window.fetch=(v,o)=>{"
-        "if(typeof Request!=='undefined'&&v instanceof Request)"
-        "return f.call(window,new Request(map(v.url),v),o);"
-        "return f.call(window,v instanceof URL?map(v.href):map(v),o)};"
-        "const X=window.XMLHttpRequest;if(X){const xo=XMLHttpRequest.prototype.open;"
-        "XMLHttpRequest.prototype.open=function(m,u,...a){return xo.call(this,m,map(u),...a)}};"
+        "const f=window.fetch;if(f)window.fetch=(v,o)=>{try{const isReq=typeof Request!=='undefined'&&v instanceof Request;"
+        "const mode=String(o&&o.credentials||isReq&&v.credentials||'same-origin');"
+        "const h=new Headers(o&&o.headers||isReq&&v.headers||undefined);h.set('X-Cookie-Core-Credentials',mode);"
+        "const init=Object.assign({},o||{},{credentials:'same-origin',headers:h});"
+        "return f.call(window,isReq?new Request(map(v.url),v):v instanceof URL?map(v.href):map(v),init)}"
+        "catch(_e){return f.call(window,v,o)}};"
+        "const reportClientError=function(kind,message,source,line,column,stack){"
+        "if(!f)return;try{const cut=(v,n)=>String(v==null?'':v).slice(0,n);"
+        "const body=JSON.stringify({kind:cut(kind,40),message:cut(message,1000),source:cut(source,1000),"
+        "line:Number(line)||0,column:Number(column)||0,stack:cut(stack,4000)});"
+        "f.call(window,map(C.prefix+'/__diagnostics/client-error'),{method:'POST',credentials:'same-origin',"
+        "headers:{'Content-Type':'application/json'},cache:'no-store',keepalive:true,body}).catch(()=>{})}catch(_e){}};"
+        "if(window.addEventListener){addEventListener('error',function(e){const t=e.target;"
+        "if(t&&t!==window){reportClientError('resource_error','Resource failed to load',t.src||t.href||'',0,0,'');return}"
+        "reportClientError('javascript_error',e.message,e.filename,e.lineno,e.colno,e.error&&e.error.stack)},true);"
+        "addEventListener('unhandledrejection',function(e){const r=e.reason;"
+        "reportClientError('unhandled_rejection',r&&r.message||r,'',0,0,r&&r.stack)},true)};"
+        "const X=window.XMLHttpRequest;if(X){const xp=XMLHttpRequest.prototype,xo=xp.open,xs=xp.send,xt=Symbol('cookieCoreTarget');"
+        "xp.open=function(m,u,...a){this[xt]=String(u);return xo.call(this,m,map(u),...a)};"
+        "xp.send=function(...a){try{this.setRequestHeader('X-Cookie-Core-Credentials',this.withCredentials?'include':'same-origin')}catch(_e){}return xs.apply(this,a)}};"
         "const sb=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);"
         "if(sb)navigator.sendBeacon=(u,d)=>sb(map(u),d);"
         "const W=window.WebSocket;if(W){window.WebSocket=function(u,p){"
         "return p===undefined?new W(map(u,true)):new W(map(u,true),p)};"
         "window.WebSocket.prototype=W.prototype;"
         "try{Object.setPrototypeOf(window.WebSocket,W)}catch(_e){}};"
-        "const E=window.EventSource;if(E){window.EventSource=function(u,o){return new E(map(u),o)};"
+        "const E=window.EventSource;if(E){const eventUrl=function(u,o){const m=String(map(u)),i=m.indexOf('#'),"
+        "base=i<0?m:m.slice(0,i),frag=i<0?'':m.slice(i),mode=o&&o.withCredentials?'include':'same-origin';"
+        "return base+(base.includes('?')?'&':'?')+C.credentialsParam+'='+mode+frag};"
+        "window.EventSource=function(u,o){return new E(eventUrl(u,o),o)};"
         "window.EventSource.prototype=E.prototype;"
         "try{Object.setPrototypeOf(window.EventSource,E)}catch(_e){}};"
         "for(const k of ['Worker','SharedWorker']){"
@@ -719,15 +989,23 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "return v.split(',').map(function(x){const m=x.trim().match(/^(\\S+)(.*)$/);"
         "return m?map(m[1])+m[2]:x}).join(', ')};"
         "Element.prototype.setAttribute=function(n,v){"
-        "if(/^(?:href|src|action|poster|data|formaction)$/i.test(n))v=map(v);"
-        "else if(/^srcset$/i.test(n))v=mapSrcset(v);"
+        "if(/^(?:href|src|action|poster|data|formaction|xlink:href|cite|longdesc|background|codebase|manifest|data-src|data-lazy-src|data-original|data-href|data-url|data-poster|data-background)$/i.test(n))v=map(v);"
+        "else if(/^(?:srcset|imagesrcset|data-srcset)$/i.test(n))v=mapSrcset(v);"
         "else if(/^style$/i.test(n))v=rewriteCss(v);"
         "return sa.call(this,n,v)};"
+        "const san=Element.prototype.setAttributeNS;if(san)Element.prototype.setAttributeNS=function(ns,n,v){"
+        "if(String(n).toLowerCase()==='href'&&String(ns||'').includes('xlink'))v=map(v);"
+        "return san.call(this,ns,n,v)};"
         "for(const [name,prop,mapper] of [['HTMLAnchorElement','href',map],"
         "['HTMLAreaElement','href',map],['HTMLImageElement','src',map],"
         "['HTMLImageElement','srcset',mapSrcset],['HTMLScriptElement','src',map],"
         "['HTMLIFrameElement','src',map],['HTMLLinkElement','href',map],"
-        "['HTMLFormElement','action',map],['HTMLSourceElement','src',map],"
+        "['HTMLFormElement','action',map],['HTMLInputElement','formAction',map],"
+        "['HTMLButtonElement','formAction',map],['HTMLObjectElement','data',map],"
+        "['HTMLObjectElement','codeBase',map],['HTMLModElement','cite',map],"
+        "['HTMLQuoteElement','cite',map],"
+        "['HTMLEmbedElement','src',map],['HTMLTrackElement','src',map],"
+        "['HTMLVideoElement','poster',map],['HTMLBaseElement','href',map],['HTMLSourceElement','src',map],"
         "['HTMLSourceElement','srcset',mapSrcset],['HTMLVideoElement','src',map],"
         "['HTMLAudioElement','src',map]]){const ctor=window[name];if(!ctor)continue;"
         "const d=Object.getOwnPropertyDescriptor(ctor.prototype,prop);"
@@ -737,6 +1015,15 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "const ps=history.pushState.bind(history),rs=history.replaceState.bind(history);"
         "history.pushState=(s,t,u)=>ps(s,t,u==null?u:map(u));"
         "history.replaceState=(s,t,u)=>rs(s,t,u==null?u:map(u));"
+        "if(window.navigation&&navigation.navigate){const nn=navigation.navigate.bind(navigation);navigation.navigate=(u,o)=>nn(map(u),o)}"
+        "try{const SP=window.CSSStyleDeclaration&&CSSStyleDeclaration.prototype;if(SP){const ss=SP.setProperty;"
+        "SP.setProperty=function(n,v,p){return ss.call(this,n,rewriteCss(v),p)};const sd=Object.getOwnPropertyDescriptor(SP,'cssText');"
+        "if(sd&&sd.configurable&&sd.get&&sd.set)Object.defineProperty(SP,'cssText',{configurable:true,enumerable:sd.enumerable,get:sd.get,set(v){sd.set.call(this,rewriteCss(v))}})}}catch(_e){}"
+        "try{const CP=window.CSSStyleSheet&&CSSStyleSheet.prototype;if(CP){const ci=CP.insertRule;"
+        "if(ci)CP.insertRule=function(r,i){return ci.call(this,rewriteCss(r),i)};const cr=CP.replace,cs=CP.replaceSync;"
+        "if(cr)CP.replace=function(v){return cr.call(this,rewriteCss(v))};if(cs)CP.replaceSync=function(v){return cs.call(this,rewriteCss(v))}}}catch(_e){}"
+        "for(const w of [window.CSS&&CSS.paintWorklet,window.CSS&&CSS.animationWorklet,window.CSS&&CSS.layoutWorklet]){"
+        "if(w&&w.addModule){const wa=w.addModule.bind(w);w.addModule=(u,o)=>wa(map(u),o)}}"
         "if(window.Storage){try{const S=Storage.prototype,raw=window.localStorage,p=C.cookieNamespace+'store:';"
         "const gi=S.getItem,si=S.setItem,ri=S.removeItem,ci=S.clear,ki=S.key;"
         "const ld=Object.getOwnPropertyDescriptor(S,'length'),ln=ld&&ld.get;"
@@ -775,13 +1062,30 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "getOwnPropertyDescriptor(_t,k){if(typeof k==='string'&&api.getItem(k)!==null)return{configurable:true,enumerable:true,writable:true,value:api.getItem(k)}},"
         "defineProperty(_t,k,d){if(typeof k==='string'&&'value'in d){api.setItem(k,d.value);return true}return false}});"
         "try{Object.defineProperty(window,'localStorage',{configurable:true,get:function(){return facade}})}catch(_e){}"
+        "const rawSession=window.sessionStorage,sp=C.cookieNamespace+'session:';"
+        "const skeys=function(){const out=[];if(!rawSession)return out;for(let i=0;i<(ln?ln.call(rawSession):0);i++){"
+        "const k=ki.call(rawSession,i);if(typeof k==='string'&&k.startsWith(sp))out.push(k.slice(sp.length))}return out};"
+        "const sapi={getItem(k){return rawSession?gi.call(rawSession,sp+String(k)):null},setItem(k,v){"
+        "if(rawSession)si.call(rawSession,sp+String(k),String(v))},removeItem(k){if(rawSession)ri.call(rawSession,sp+String(k))},"
+        "clear(){if(rawSession)for(const k of skeys())ri.call(rawSession,sp+k)},key(n){return skeys()[Number(n)]??null}};"
+        "const starget=Object.create(S),sfacade=new Proxy(starget,{get(_t,k){if(k==='length')return skeys().length;"
+        "if(k===Symbol.toStringTag)return 'Storage';if(typeof k==='string'&&Object.prototype.hasOwnProperty.call(sapi,k))return sapi[k].bind(sapi);"
+        "if(typeof k==='string'){const v=sapi.getItem(k);return v===null?undefined:v}return Reflect.get(starget,k)},"
+        "set(_t,k,v){if(typeof k==='string'){sapi.setItem(k,v);return true}return false},"
+        "deleteProperty(_t,k){if(typeof k==='string'){sapi.removeItem(k);return true}return false},ownKeys(){return skeys()},"
+        "has(_t,k){return typeof k==='string'&&sapi.getItem(k)!==null},getOwnPropertyDescriptor(_t,k){"
+        "if(typeof k==='string'&&sapi.getItem(k)!==null)return{configurable:true,enumerable:true,writable:true,value:sapi.getItem(k)}},"
+        "defineProperty(_t,k,d){if(typeof k==='string'&&'value'in d){sapi.setItem(k,d.value);return true}return false}});"
+        "if(rawSession)try{Object.defineProperty(window,'sessionStorage',{configurable:true,get:function(){return sfacade}})}catch(_e){}"
         "const managed=function(o){return o===raw||o===facade||o===target};"
-        "S.getItem=function(k){return managed(this)?api.getItem(k):gi.call(this,k)};"
-        "S.setItem=function(k,v){return managed(this)?api.setItem(k,v):si.call(this,k,v)};"
-        "S.removeItem=function(k){return managed(this)?api.removeItem(k):ri.call(this,k)};"
-        "S.clear=function(){return managed(this)?api.clear():ci.call(this)};S.key=function(n){return managed(this)?api.key(n):ki.call(this,n)};"
+        "const managedSession=function(o){return o===rawSession||o===sfacade||o===starget};"
+        "S.getItem=function(k){return managed(this)?api.getItem(k):managedSession(this)?sapi.getItem(k):gi.call(this,k)};"
+        "S.setItem=function(k,v){return managed(this)?api.setItem(k,v):managedSession(this)?sapi.setItem(k,v):si.call(this,k,v)};"
+        "S.removeItem=function(k){return managed(this)?api.removeItem(k):managedSession(this)?sapi.removeItem(k):ri.call(this,k)};"
+        "S.clear=function(){return managed(this)?api.clear():managedSession(this)?sapi.clear():ci.call(this)};"
+        "S.key=function(n){return managed(this)?api.key(n):managedSession(this)?sapi.key(n):ki.call(this,n)};"
         "if(ld&&ld.configurable)Object.defineProperty(S,'length',{configurable:true,enumerable:ld.enumerable,"
-        "get:function(){return managed(this)?keys().length:ln.call(this)}});"
+        "get:function(){return managed(this)?keys().length:managedSession(this)?skeys().length:ln.call(this)}});"
         "if(window.StorageEvent&&window.dispatchEvent)addEventListener('storage',function(e){try{"
         "if(e.storageArea!==raw||typeof e.key!=='string'||!e.key.startsWith(p))return;e.stopImmediatePropagation();"
         "dispatchEvent(new StorageEvent('storage',{key:e.key.slice(p.length),oldValue:e.oldValue,newValue:e.newValue,"
@@ -790,9 +1094,21 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "document.addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')flush()},{capture:true,passive:true});"
         "if(window.indexedDB){const io=indexedDB.open.bind(indexedDB),"
         "id=indexedDB.deleteDatabase.bind(indexedDB);indexedDB.open=(n,...a)=>io(p+n,...a);"
-        "indexedDB.deleteDatabase=n=>id(p+n)}"
+        "indexedDB.deleteDatabase=n=>id(p+n);const dbs=indexedDB.databases&&indexedDB.databases.bind(indexedDB);"
+        "if(dbs)indexedDB.databases=()=>dbs().then(a=>a.filter(x=>typeof x.name==='string'&&x.name.startsWith(p))"
+        ".map(x=>Object.assign({},x,{name:x.name.slice(p.length)})))}"
+        "if(window.openDatabase){const od=window.openDatabase;window.openDatabase=(n,...a)=>od.call(window,p+n,...a)}"
+        "if(navigator.locks){const lm=navigator.locks,lr=lm.request.bind(lm),lq=lm.query&&lm.query.bind(lm),lp=p+'lock:';"
+        "lm.request=(n,...a)=>lr(lp+String(n),...a);if(lq)lm.query=()=>lq().then(s=>({"
+        "held:(s.held||[]).filter(x=>x.name&&x.name.startsWith(lp)).map(x=>Object.assign({},x,{name:x.name.slice(lp.length)})),"
+        "pending:(s.pending||[]).filter(x=>x.name&&x.name.startsWith(lp)).map(x=>Object.assign({},x,{name:x.name.slice(lp.length)}))}))}"
         "const BC=window.BroadcastChannel;if(BC){window.BroadcastChannel=function(n){return new BC(p+n)};"
         "window.BroadcastChannel.prototype=BC.prototype;Object.setPrototypeOf(window.BroadcastChannel,BC)}"
+        "if(window.caches){const cs=window.caches,cp=p+'cache:',co=cs.open.bind(cs),cd=cs.delete.bind(cs),"
+        "ch=cs.has.bind(cs),ck=cs.keys.bind(cs),cm=cs.match.bind(cs);cs.open=n=>co(cp+String(n));cs.delete=n=>cd(cp+String(n));"
+        "cs.has=n=>ch(cp+String(n));cs.keys=()=>ck().then(a=>a.filter(n=>n.startsWith(cp)).map(n=>n.slice(cp.length)));"
+        "cs.match=(r,o)=>{if(o&&o.cacheName){const x=Object.assign({},o,{cacheName:cp+String(o.cacheName)});return cm(r,x)}"
+        "return ck().then(a=>a.filter(n=>n.startsWith(cp))).then(async a=>{for(const n of a){const c=await co(n),v=await c.match(r,o);if(v)return v}})}}"
         "}catch(_e){}}"
         "if(navigator.serviceWorker&&navigator.serviceWorker.register){try{"
         "const sr=navigator.serviceWorker.register.bind(navigator.serviceWorker);"
@@ -834,19 +1150,63 @@ def _runtime_script(launch: ConsumedLaunch, prefix: str, public_base_url: str) -
         "+'<path d=\"M8 10V7a4 4 0 0 1 8 0v3\"/></svg>';b.appendChild(badge)})};"
         "lock();if(window.MutationObserver)new MutationObserver(lock).observe(document.documentElement,{childList:true,subtree:true});"
         "}"
-        "let dc=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');"
+        "let dc=Object.getOwnPropertyDescriptor(Document.prototype,'cookie'),CN=C.browserCookieNamespace;"
+        "const logicalCookieUrl=function(){const u=new URL(C.upstreamOrigin);let p=location.pathname||'/';"
+        "if(C.prefix&&p.startsWith(C.prefix))p=p.slice(C.prefix.length)||'/';"
+        "if(p.startsWith('/_host/')){const r=p.slice(7),cut=r.indexOf('/'),a=cut<0?r:r.slice(0,cut);"
+        "try{const h=new URL('https://'+a);u.hostname=h.hostname;u.port=h.port}catch(_e){}"
+        "p=cut<0?'/':r.slice(cut)}u.pathname=p||'/';return u};"
+        "const scopeB64=function(v){const s=JSON.stringify(v);let raw;"
+        "try{raw=unescape(encodeURIComponent(s))}catch(_e){return ''}"
+        "return btoa(raw).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')};"
+        "const scopeRead=function(v){try{let s=v.replace(/-/g,'+').replace(/_/g,'/');"
+        "s+='='.repeat((4-s.length%4)%4);const a=JSON.parse(decodeURIComponent(escape(atob(s))));"
+        "if(!Array.isArray(a)||a.length!==4||(a[0]!==0&&a[0]!==1)||typeof a[1]!=='string'||"
+        "typeof a[2]!=='string'||typeof a[3]!=='string'||!a[1]||!a[2].startsWith('/'))return null;return a}"
+        "catch(_e){return null}};"
+        "const scopeMatches=function(a,u){const h=u.hostname.toLowerCase(),d=a[1].toLowerCase().replace(/^\\.|\\.$/g,''),"
+        "p=u.pathname||'/',cp=a[2]||'/';return (a[0]?h===d:h===d||h.endsWith('.'+d))&&"
+        "(cp==='/'||p===cp||p.startsWith(cp.replace(/\\/$/,'')+'/'))};"
+        "const readVirtualCookies=function(doc){if(!dc||!dc.get)return '';const u=logicalCookieUrl(),out=[];"
+        "for(const x of dc.get.call(doc).split(/;\\s*/).filter(Boolean)){const i=x.indexOf('='),raw=i<0?x:x.slice(0,i),"
+        "ns=raw.startsWith(CN)?CN:raw.startsWith(C.cookieNamespace)?C.cookieNamespace:'';if(!ns)continue;"
+        "const n=raw.slice(ns.length),value=i<0?'':x.slice(i+1);"
+        "if(n.startsWith('v2d_'))continue;if(n.startsWith('v2_')){const a=scopeRead(n.slice(3));"
+        "if(a&&scopeMatches(a,u))out.push([a[3],value,a[2].length]);continue}"
+        "try{out.push([decodeURIComponent(n),value,0])}catch(_e){}}"
+        "return out.sort((a,b)=>b[2]-a[2]).map(x=>x[0]+'='+x[1]).join('; ')};"
+        "const setVirtualCookie=function(doc,v){if(!dc||!dc.set||typeof v!=='string')return;const p=v.split(';'),i=p[0].indexOf('=');"
+        "if(i<=0)return;const n=p[0].slice(0,i).trim(),value=p[0].slice(i+1);"
+        "if(!n||!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(n)||/[\\r\\n;]/.test(value))return;"
+        "const u=logicalCookieUrl(),host=u.hostname.toLowerCase();let domain=host,hostOnly=1;"
+        "let cp=u.pathname||'/',slash=cp.lastIndexOf('/'),path=!cp.startsWith('/')||slash<=0?'/':cp.slice(0,slash);"
+        "let expiry=[],deleted=false;for(const raw of p.slice(1)){const j=raw.indexOf('='),"
+        "key=(j<0?raw:raw.slice(0,j)).trim().toLowerCase(),val=(j<0?'':raw.slice(j+1)).trim();"
+        "if(key==='domain'&&val){let d=val.toLowerCase().replace(/^\\.+|\\.+$/g,'');"
+        "try{d=new URL('https://'+d).hostname}catch(_e){return}"
+        "if(C.blockedCookieDomains.indexOf(d)>=0||(host!==d&&!host.endsWith('.'+d)))return;domain=d;hostOnly=0}"
+        "else if(key==='path'&&val.startsWith('/')&&val.length<=500)path=val;"
+        "else if(key==='max-age'&&/^-?\\d+$/.test(val)){expiry=['Max-Age='+val];if(Number(val)<=0)deleted=true}"
+        "else if(key==='expires'&&!expiry.length){const when=Date.parse(val);if(Number.isFinite(when)){expiry=['Expires='+val];"
+        "if(when<=Date.now())deleted=true}}}"
+        "const code=scopeB64([hostOnly,domain,path,n]);if(!code)return;const live=CN+'v2_'+code,"
+        "dead=CN+'v2d_'+code,base='; Path='+(C.prefix||'')+'/; Secure; SameSite=Lax';"
+        "if(deleted){dc.set.call(doc,live+'='+base+'; Max-Age=0');dc.set.call(doc,dead+'=1'+base)}"
+        "else{dc.set.call(doc,dead+'='+base+'; Max-Age=0');dc.set.call(doc,live+'='+value+base+"
+        "(expiry.length?'; '+expiry.join('; '):''))}};"
         "if(dc&&dc.configurable&&dc.get&&dc.set)Object.defineProperty(Document.prototype,'cookie',{"
-        "configurable:dc.configurable,enumerable:dc.enumerable,"
-        "get:function(){return dc.get.call(this).split(/;\\s*/).filter(Boolean).flatMap(function(x){"
-        "const i=x.indexOf('=');if(i<0||!x.slice(0,i).startsWith(C.cookieNamespace))return [];"
-        "try{return [decodeURIComponent(x.slice(C.cookieNamespace.length,i))+x.slice(i)]}"
-        "catch(_e){return []}}).join('; ')},"
-        "set:function(v){if(typeof v!=='string')return;const p=v.split(';'),i=p[0].indexOf('=');if(i<=0)return;"
-        "const n=p[0].slice(0,i).trim(),value=p[0].slice(i+1);"
-        "const attrs=p.slice(1).map(function(x){return x.trim()}).filter(function(x){return /^(?:expires|max-age)=/i.test(x)});"
-        "dc.set.call(this,C.cookieNamespace+encodeURIComponent(n)+'='+value+'; Path='+C.prefix+"
-        "'/; Secure; SameSite=Lax'+(attrs.length?'; '+attrs.join('; '):''));}"
-        "});"
+        "configurable:dc.configurable,enumerable:dc.enumerable,get:function(){return readVirtualCookies(this)},"
+        "set:function(v){setVirtualCookie(this,v)}});"
+        "if(window.cookieStore){try{const cs=window.cookieStore,parse=function(){return readVirtualCookies(document).split(/;\\s*/).filter(Boolean).map(x=>{"
+        "const i=x.indexOf('=');return{name:i<0?x:x.slice(0,i),value:i<0?'':x.slice(i+1)}})};"
+        "cs.get=async function(q){const name=typeof q==='string'?q:q&&q.name;return parse().find(x=>x.name===name)||null};"
+        "cs.getAll=async function(q){const name=typeof q==='string'?q:q&&q.name;return name?parse().filter(x=>x.name===name):parse()};"
+        "cs.set=async function(a,b){const o=typeof a==='object'?a:{name:a,value:b},attrs=[];"
+        "for(const k of ['domain','path','expires'])if(o[k]!=null)attrs.push(k+'='+o[k]);"
+        "setVirtualCookie(document,String(o.name)+'='+String(o.value??'')+(attrs.length?'; '+attrs.join('; '):''))};"
+        "cs.delete=async function(q){const o=typeof q==='string'?{name:q}:q||{},attrs=[];"
+        "for(const k of ['domain','path'])if(o[k]!=null)attrs.push(k+'='+o[k]);"
+        "setVirtualCookie(document,String(o.name)+'=; Max-Age=0'+(attrs.length?'; '+attrs.join('; '):''))}}catch(_e){}}"
         "})();</script>"
     )
 
@@ -954,6 +1314,7 @@ def rewrite_text(
     launch: ConsumedLaunch,
     proxy_prefix: str,
     public_base_url: str,
+    profile_lock_enabled: bool = True,
 ) -> bytes:
     match = re.search(r"charset=([^;\s]+)", content_type, re.IGNORECASE)
     encoding = match.group(1).strip("\"'") if match else "utf-8"
@@ -1171,21 +1532,26 @@ def rewrite_text(
         actual_host = item.group("hostname").lower()
         if _is_public_asset_host(actual_host):
             return item.group(0)
-        host_part = "" if actual_host == main else f"/_host/{actual_host}"
+        raw_port = item.groupdict().get("port") or ""
+        main_url = urlparse(launch.upstream_url)
+        actual_port = int(raw_port.lstrip(":")) if raw_port else None
+        same_authority = actual_host == main and (actual_port or 443) == (main_url.port or 443)
+        authority = actual_host + raw_port
+        host_part = "" if same_authority else f"/_host/{authority}"
         scheme = "wss" if websocket else proxy_origin.scheme
         return f"{scheme}://{proxy_origin.netloc}{proxy_prefix}{host_part}"
 
     for allowed in sorted(launch.allowed_domains, key=len, reverse=True):
         host = allowed.lower().lstrip(".")
         text = re.sub(
-            rf"https?://(?P<hostname>(?:[a-z0-9-]+\.)*{re.escape(host)})(?::\d+)?"
+            rf"https?://(?P<hostname>(?:[a-z0-9-]+\.)*{re.escape(host)})(?P<port>:\d+)?"
             rf"(?=[/\"'])",
             replace_allowed_origin,
             text,
             flags=re.I,
         )
         text = re.sub(
-            rf"wss?://(?P<hostname>(?:[a-z0-9-]+\.)*{re.escape(host)})(?::\d+)?"
+            rf"wss?://(?P<hostname>(?:[a-z0-9-]+\.)*{re.escape(host)})(?P<port>:\d+)?"
             rf"(?=[/\"'])",
             lambda item: replace_allowed_origin(item, websocket=True),
             text,
@@ -1196,7 +1562,12 @@ def rewrite_text(
         text = text.replace(f"\x00COOKIE_CORE_DIRECT_{index}\x00", original)
 
     if content_type.lower().startswith("text/html"):
-        script = _runtime_script(launch, proxy_prefix, public_base_url)
+        script = _runtime_script(
+            launch,
+            proxy_prefix,
+            public_base_url,
+            profile_lock_enabled=profile_lock_enabled,
+        )
         head = re.search(r"<head(?:\s[^>]*)?>", text, re.IGNORECASE)
         if head:
             text = text[: head.end()] + script + text[head.end() :]
@@ -1329,6 +1700,17 @@ def _fix_response_content_type(headers: dict[str, str], target_url: str) -> None
     override = MIME_OVERRIDE_BY_EXTENSION.get(ext)
     if override:
         _replace_response_header(headers, "content-type", override)
+
+
+def _response_content_length(headers: httpx.Headers) -> int | None:
+    raw = headers.get("content-length")
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
 
 
 def launch_loading_response(destination: str) -> HTMLResponse:
@@ -1544,6 +1926,9 @@ class ReverseProxy:
         self.settings = settings
         self.client = client
         self._hostname_cache: dict[str, tuple[float, str | None]] = {}
+        self._egress_guard = PublicAddressGuard(
+            cache_seconds=getattr(settings, "egress_dns_cache_seconds", 60)
+        )
 
     async def service_id_for_hostname(self, hostname: str) -> str | None:
         normalized = hostname.lower().rstrip(".")
@@ -1558,6 +1943,91 @@ class ReverseProxy:
     def clear_hostname_cache(self) -> None:
         self._hostname_cache.clear()
 
+    def finalize_browser_response(self, request: Request, response: Response) -> None:
+        """Refresh an active proxy session and mirror script-visible rotations."""
+        grant = getattr(request.state, "cookie_core_grant", None)
+        service_id = getattr(request.state, "cookie_core_service_id", None)
+        prefix = getattr(request.state, "cookie_core_prefix", None)
+        if grant and service_id and prefix is not None:
+            response.set_cookie(
+                "__Secure-cookie_core_proxy",
+                grant,
+                secure=self.settings.secure_cookies,
+                httponly=True,
+                samesite="lax",
+                path=prefix + "/",
+            )
+            if prefix:
+                response.set_cookie(
+                    _root_grant_cookie_name(service_id),
+                    grant,
+                    secure=self.settings.secure_cookies,
+                    httponly=True,
+                    samesite="lax",
+                    path="/",
+                )
+
+        updates: list[CapturedCookie] = getattr(
+            request.state, "cookie_core_client_cookie_updates", []
+        )
+        if not service_id or prefix is None:
+            return
+        for captured in updates:
+            cookie = captured.cookie
+            internal_name = _client_cookie_name(
+                service_id,
+                name=cookie.name,
+                domain=cookie.domain,
+                path=cookie.path,
+                host_only=cookie.host_only,
+            )
+            tombstone_name = _client_cookie_name(
+                service_id,
+                name=cookie.name,
+                domain=cookie.domain,
+                path=cookie.path,
+                host_only=cookie.host_only,
+                deleted=True,
+            )
+            if captured.deleted or cookie.http_only:
+                for raw_name in (internal_name, tombstone_name):
+                    response.delete_cookie(
+                        raw_name,
+                        path=prefix + "/",
+                        secure=self.settings.secure_cookies,
+                        samesite="lax",
+                    )
+                continue
+            encoded_cookie_size = len(
+                (internal_name + cookie.value).encode("utf-8", errors="replace")
+            )
+            if encoded_cookie_size > 3800:
+                logger.warning(
+                    "script_visible_cookie_too_large service=%s name_hash=%s bytes=%s",
+                    service_id,
+                    hashlib.sha256(cookie.name.encode()).hexdigest()[:12],
+                    encoded_cookie_size,
+                )
+                continue
+            response.delete_cookie(
+                tombstone_name,
+                path=prefix + "/",
+                secure=self.settings.secure_cookies,
+                samesite="lax",
+            )
+            max_age = None
+            if cookie.expires_at is not None:
+                max_age = max(0, int(cookie.expires_at.timestamp() - time.time()))
+            response.set_cookie(
+                internal_name,
+                cookie.value,
+                max_age=max_age,
+                secure=self.settings.secure_cookies,
+                httponly=False,
+                samesite="lax",
+                path=prefix + "/",
+            )
+
     async def http(
         self,
         service_id: str,
@@ -1568,7 +2038,18 @@ class ReverseProxy:
         transparent_hostname: str | None = None,
     ) -> Response:
         prefix = "" if transparent else f"/proxy/{service_id}"
-        launch_token = request.query_params.get("launch")
+        path = _raw_request_path(request, service_id, path, transparent=transparent)
+        raw_query = request.scope.get("query_string", b"").decode("latin-1")
+        query_credentials_mode = request.query_params.get(CREDENTIALS_QUERY_PARAM, "").lower()
+        upstream_query = _strip_query_parameter(raw_query, CREDENTIALS_QUERY_PARAM)
+        raw_grant = request.cookies.get("__Secure-cookie_core_proxy") or request.cookies.get(
+            _root_grant_cookie_name(service_id)
+        )
+        launch_key = LAUNCH_QUERY_PARAM
+        launch_token = request.query_params.get(LAUNCH_QUERY_PARAM)
+        if not launch_token and not raw_grant:
+            launch_key = LEGACY_LAUNCH_QUERY_PARAM
+            launch_token = request.query_params.get(LEGACY_LAUNCH_QUERY_PARAM)
         if launch_token:
             try:
                 launch = await self.core.consume_launch(raw_token=launch_token)
@@ -1579,8 +2060,11 @@ class ReverseProxy:
                 )
             except ValueError:
                 raise HTTPException(401, "Launch link is invalid, expired, or already used")
-            clean = [(k, v) for k, v in request.query_params.multi_items() if k != "launch"]
-            destination = request.url.path + ("?" + urlencode(clean) if clean else "")
+            clean_query = _strip_query_parameter(upstream_query, launch_key)
+            raw_browser_path = request.scope.get("raw_path", request.url.path.encode()).decode(
+                "latin-1"
+            )
+            destination = raw_browser_path + ("?" + clean_query if clean_query else "")
             response = launch_loading_response(destination)
             _expire_stale_client_cookies(
                 response,
@@ -1592,7 +2076,7 @@ class ReverseProxy:
             initial_target = resolve_target(
                 launch,
                 path,
-                urlencode(clean) if clean else "",
+                clean_query,
             )
             _seed_script_visible_cookies(
                 response,
@@ -1604,7 +2088,6 @@ class ReverseProxy:
             response.set_cookie(
                 "__Secure-cookie_core_proxy",
                 grant,
-                max_age=self.settings.proxy_grant_ttl_seconds,
                 secure=self.settings.secure_cookies,
                 httponly=True,
                 samesite="lax",
@@ -1619,7 +2102,6 @@ class ReverseProxy:
                 response.set_cookie(
                     _root_grant_cookie_name(service_id),
                     grant,
-                    max_age=self.settings.proxy_grant_ttl_seconds,
                     secure=self.settings.secure_cookies,
                     httponly=True,
                     samesite="lax",
@@ -1627,18 +2109,22 @@ class ReverseProxy:
                 )
             return response
 
-        raw_grant = request.cookies.get("__Secure-cookie_core_proxy") or request.cookies.get(
-            _root_grant_cookie_name(service_id)
-        )
         if not raw_grant:
             raise HTTPException(401, "Proxy session is missing")
         try:
-            launch = await self.core.proxy_grant(raw_grant=raw_grant, service_id=service_id)
+            launch = await self.core.proxy_grant(
+                raw_grant=raw_grant,
+                service_id=service_id,
+                renew_ttl_seconds=self.settings.proxy_grant_ttl_seconds,
+            )
         except (ValueError, TypeError):
             raise HTTPException(401, "Proxy session is invalid or expired")
         request_hostname = (transparent_hostname or request.url.hostname or "").lower().rstrip(".")
         if transparent and (not launch.proxy_hostname or request_hostname != launch.proxy_hostname):
             raise HTTPException(421, "Proxy hostname does not match this service")
+        request.state.cookie_core_grant = raw_grant
+        request.state.cookie_core_service_id = service_id
+        request.state.cookie_core_prefix = prefix
         public_base_url = (
             f"https://{launch.proxy_hostname}"
             if transparent and launch.proxy_hostname
@@ -1650,6 +2136,36 @@ class ReverseProxy:
         # instead of surfacing a harmless 404 in every proxied page.
         if _is_optional_telemetry_path(path):
             return Response(status_code=204, headers={"X-Cookie-Core-Telemetry": "ignored"})
+        if _is_client_error_path(path):
+            origin = request.headers.get("origin")
+            if origin and origin.rstrip("/") != public_base_url:
+                raise HTTPException(403, "Request origin is not allowed")
+            if request.method != "POST":
+                raise HTTPException(405, "Method not allowed")
+            raw_body = await request.body()
+            if len(raw_body) > 16_384:
+                raise HTTPException(413, "Client diagnostic payload is too large")
+            try:
+                event = json.loads(raw_body)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                raise HTTPException(400, "Invalid client diagnostic payload")
+            if not isinstance(event, dict):
+                raise HTTPException(400, "Invalid client diagnostic payload")
+            logger.warning(
+                "browser_page_error request_id=%s service=%s user=%s kind=%s message=%s source=%s line=%s column=%s stack=%s",
+                getattr(request.state, "request_id", "unknown"),
+                service_id,
+                hashlib.sha256(launch.user_id.encode()).hexdigest()[:12],
+                _diagnostic_text(event.get("kind"), 40),
+                _diagnostic_text(event.get("message"), 1000),
+                _diagnostic_text(event.get("source"), 1000),
+                int(event.get("line") or 0) if str(event.get("line") or "0").isdigit() else 0,
+                int(event.get("column") or 0)
+                if str(event.get("column") or "0").isdigit()
+                else 0,
+                _diagnostic_text(event.get("stack"), 4000),
+            )
+            return Response(status_code=204, headers={"X-Cookie-Core-Diagnostics": "recorded"})
         # localStorage bidirectional sync endpoint.
         if _is_localstorage_sync_path(path):
             origin = request.headers.get("origin")
@@ -1703,8 +2219,15 @@ class ReverseProxy:
                 raise HTTPException(403, "Request origin is not allowed")
         # Preserve signed/opaque query strings byte-for-byte. The only query we
         # consume (launch) already returned through the redirect branch above.
-        query = request.scope.get("query_string", b"").decode("latin-1")
-        target = resolve_target(launch, path, query)
+        target = resolve_target(launch, path, upstream_query)
+        try:
+            await self._egress_guard.check(target)
+        except ValueError as exc:
+            raise HTTPException(
+                403,
+                str(exc),
+                headers={"X-Cookie-Core-Error-Source": "proxy-core:egress-policy"},
+            ) from exc
         target_parts = urlparse(target)
         if _must_stay_in_browser(target_parts.hostname or "", target_parts.path):
             # Recover from stale/cached pages that still contain an old proxied
@@ -1724,7 +2247,14 @@ class ReverseProxy:
             key: value
             for key, value in request.headers.items()
             if key.lower() not in HOP_HEADERS
-            and key.lower() not in {"content-length", "origin", "referer", "accept-encoding"}
+            and key.lower()
+            not in {
+                "content-length",
+                "origin",
+                "referer",
+                "accept-encoding",
+                "x-cookie-core-credentials",
+            }
         }
         headers["Accept-Encoding"] = "identity"
         if request.headers.get("sec-fetch-dest", "").lower() == "document":
@@ -1736,9 +2266,18 @@ class ReverseProxy:
             headers["Referer"] = initiator
         if request.headers.get("sec-fetch-site"):
             headers["Sec-Fetch-Site"] = upstream_fetch_site(initiator, target)
-        cookies = _upstream_cookie_header(launch, target, request.cookies)
-        if cookies:
-            headers["Cookie"] = cookies
+        credentials_mode = (
+            request.headers.get("x-cookie-core-credentials", "").lower()
+            or query_credentials_mode
+        )
+        credentials_allowed = credentials_mode != "omit" and not (
+            credentials_mode == "same-origin"
+            and _url_origin(initiator) != _url_origin(target)
+        )
+        if credentials_allowed:
+            cookies = _upstream_cookie_header(launch, target, request.cookies)
+            if cookies:
+                headers["Cookie"] = cookies
         upstream_request = self.client.build_request(
             request.method, target, headers=headers, content=request.stream()
         )
@@ -1746,6 +2285,12 @@ class ReverseProxy:
         should_stream = _is_streaming_request(upstream_request)
         try:
             upstream = await self.client.send(upstream_request, stream=True)
+        except RequestBodyTooLarge as exc:
+            raise HTTPException(
+                413,
+                "Request body is too large",
+                headers={"X-Cookie-Core-Error-Source": "proxy-core:request-body"},
+            ) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(
                 502,
@@ -1756,8 +2301,14 @@ class ReverseProxy:
                 },
             ) from exc
         try:
+            client_cookie_updates: list[CapturedCookie] = []
             for raw_cookie in upstream.headers.get_list("set-cookie"):
-                await self.core.capture_set_cookie(launch, raw_cookie, target_parts.hostname or "")
+                captured = await self.core.capture_set_cookie(
+                    launch, raw_cookie, target_parts.hostname or ""
+                )
+                if captured is not None:
+                    client_cookie_updates.append(captured)
+            request.state.cookie_core_client_cookie_updates = client_cookie_updates
             response_headers = {
                 key: value
                 for key, value in upstream.headers.items()
@@ -1907,12 +2458,31 @@ class ReverseProxy:
                     )
                 )
             content_type = upstream.headers.get("content-type", "")
-            content_length = int(upstream.headers.get("content-length", "0") or 0)
+            normalized_content_type = content_type.split(";", 1)[0].strip().lower()
+            if (
+                normalized_content_type in {
+                    "text/html",
+                    "text/event-stream",
+                    "text/x-component",
+                    "application/json",
+                    "application/json+protobuf",
+                }
+                or normalized_content_type.endswith("+json")
+            ):
+                # These bodies routinely contain account state and the injected
+                # HTML runtime includes the user's localStorage snapshot. Never
+                # let a browser/CDN reuse one user's authenticated representation.
+                response_headers["cache-control"] = "private, no-store"
+                response_headers.pop("expires", None)
+            content_length = _response_content_length(upstream.headers)
             rewritable = any(content_type.lower().startswith(item) for item in REWRITABLE_TYPES)
             if (
                 rewritable
                 and not should_stream
-                and content_length <= self.settings.proxy_max_rewrite_bytes
+                and (
+                    content_length is None
+                    or content_length <= self.settings.proxy_max_rewrite_bytes
+                )
             ):
                 body = await upstream.aread()
                 if len(body) <= self.settings.proxy_max_rewrite_bytes:
@@ -1923,6 +2493,7 @@ class ReverseProxy:
                         launch=launch,
                         proxy_prefix=prefix,
                         public_base_url=public_base_url,
+                        profile_lock_enabled=self.settings.profile_lock_enabled,
                     )
                     response_headers.pop("content-encoding", None)
                     response_headers.pop("etag", None)
@@ -1948,8 +2519,29 @@ class ReverseProxy:
                 )
 
             async def stream():
+                last_refresh = time.monotonic()
                 try:
                     async for chunk in upstream.aiter_raw():
+                        now = time.monotonic()
+                        if (
+                            now - last_refresh
+                            >= self.settings.proxy_grant_refresh_interval_seconds
+                        ):
+                            last_refresh = now
+                            try:
+                                await self.core.renew_proxy_grant(
+                                    raw_grant,
+                                    service_id,
+                                    self.settings.proxy_grant_ttl_seconds,
+                                )
+                            except Exception as exc:
+                                # An already-established download/SSE stream
+                                # must survive a brief database interruption.
+                                logger.warning(
+                                    "Proxy grant refresh failed service_id=%s error=%s",
+                                    service_id,
+                                    type(exc).__name__,
+                                )
                         yield chunk
                 finally:
                     await upstream.aclose()
@@ -1959,7 +2551,11 @@ class ReverseProxy:
                 # BrowserLikeClient buffers every non-SSE response. Returning it
                 # as a StreamingResponse drops the authoritative length and has
                 # produced HTTP/2 protocol errors for fonts/images behind CDNs.
-                body = upstream.content
+                body = (
+                    b""
+                    if request.method == "HEAD" or upstream.status_code in {204, 304}
+                    else upstream.content
+                )
                 await upstream.aclose()
                 return Response(
                     body,
@@ -1999,13 +2595,22 @@ class ReverseProxy:
         try:
             if not raw_grant:
                 raise ValueError
-            launch = await self.core.proxy_grant(raw_grant=raw_grant, service_id=service_id)
+            launch = await self.core.proxy_grant(
+                raw_grant=raw_grant,
+                service_id=service_id,
+                renew_ttl_seconds=self.settings.proxy_grant_ttl_seconds,
+            )
             if transparent and launch.proxy_hostname != hostname:
                 raise ValueError
             query = websocket.scope.get("query_string", b"").decode("latin-1")
             target = resolve_target(launch, path, query)
         except (ValueError, TypeError, HTTPException):
             await websocket.close(code=4401)
+            return
+        try:
+            await self._egress_guard.check(target)
+        except ValueError:
+            await websocket.close(code=4403)
             return
         target = target.replace("https://", "wss://", 1)
         parsed = urlparse(target)
@@ -2028,6 +2633,9 @@ class ReverseProxy:
                 origin=cast(Origin, _url_origin(launch.upstream_url)),
                 additional_headers=headers,
                 subprotocols=cast(Sequence[Subprotocol] | None, protocols or None),
+                # Use the same configured egress as HTTP and the browser
+                # clearance service. Cloudflare sessions may be IP-bound.
+                proxy=self.settings.httpx_proxy_url,
                 open_timeout=self.settings.proxy_timeout_seconds,
                 max_size=None,
             ) as upstream:
@@ -2054,9 +2662,29 @@ class ReverseProxy:
                         else:
                             await websocket.send_text(message)
 
+                async def keep_grant_alive():
+                    while True:
+                        await asyncio.sleep(self.settings.proxy_grant_refresh_interval_seconds)
+                        try:
+                            renewed = await self.core.renew_proxy_grant(
+                                raw_grant,
+                                service_id,
+                                self.settings.proxy_grant_ttl_seconds,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "WebSocket grant refresh failed service_id=%s error=%s",
+                                service_id,
+                                type(exc).__name__,
+                            )
+                            continue
+                        if not renewed:
+                            return
+
                 tasks = {
                     asyncio.create_task(browser_to_upstream()),
                     asyncio.create_task(upstream_to_browser()),
+                    asyncio.create_task(keep_grant_alive()),
                 }
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:

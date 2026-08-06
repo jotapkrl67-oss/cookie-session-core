@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -20,7 +22,47 @@ from .parser import (
     validate_localstorage_key,
     validate_localstorage_value,
 )
+from .redaction import install_redaction
 from .vault import CookieVault
+
+logger = logging.getLogger("cookie_session_core.core")
+install_redaction(logger)
+_EXTENDED_COOKIE_ATTRIBUTE = re.compile(
+    r"\s*(?:(?:partitioned|sameparty)\s*|priority\s*=.*)\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_extended_cookie_attributes(raw: str) -> str:
+    parts: list[str] = []
+    current: list[str] = []
+    quote_char = ""
+    escaped = False
+    for char in raw:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote_char:
+            current.append(char)
+            escaped = True
+            continue
+        if char in {'"', "'"}:
+            quote_char = "" if quote_char == char else (char if not quote_char else quote_char)
+            current.append(char)
+            continue
+        if char == ";" and not quote_char:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    kept = [
+        part
+        for index, part in enumerate(parts)
+        if index == 0 or not _EXTENDED_COOKIE_ATTRIBUTE.fullmatch(part)
+    ]
+    return ";".join(kept)
 
 
 def _now() -> datetime:
@@ -38,6 +80,12 @@ class ConsumedLaunch:
     cookies: list[dict]
     local_storage_items: dict[str, str] = field(default_factory=dict)
     proxy_hostname: str | None = None
+
+
+@dataclass(frozen=True)
+class CapturedCookie:
+    cookie: ImportedCookie
+    deleted: bool = False
 
 
 class CookieSessionCore:
@@ -82,7 +130,14 @@ class CookieSessionCore:
                     row["item_key"],
                 )
                 result[row["item_key"]] = value
-            except Exception:
+            except Exception as exc:
+                logger.error(
+                    "localstorage_decryption_failed user=%s service=%s key_hash=%s error=%s",
+                    hashlib.sha256(user_id.encode()).hexdigest()[:12],
+                    service_id,
+                    hashlib.sha256(str(row["item_key"]).encode()).hexdigest()[:12],
+                    type(exc).__name__,
+                )
                 continue
         return result
 
@@ -128,12 +183,12 @@ class CookieSessionCore:
                 await conn.execute(
                     """INSERT INTO cookie_core_stored_cookies(
                          user_id,service_id,name,domain,path,
-                         encrypted_value,nonce,expires_at,secure,http_only,same_site
-                       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                         encrypted_value,nonce,expires_at,secure,http_only,same_site,host_only
+                       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
                     subject_user_id,
                     service_uuid,
                     cookie.name,
-                    cookie.domain.lower(),
+                    cookie.domain.lower().strip("."),
                     cookie.path,
                     encrypted.ciphertext,
                     encrypted.nonce,
@@ -141,6 +196,7 @@ class CookieSessionCore:
                     cookie.secure,
                     cookie.http_only,
                     cookie.same_site,
+                    cookie.host_only,
                 )
             await conn.execute(
                 """INSERT INTO cookie_core_audit_logs(
@@ -211,6 +267,8 @@ class CookieSessionCore:
                 "SELECT * FROM cookie_core_services WHERE id=$1 AND enabled=true",
                 grant["service_id"],
             )
+            if not service:
+                raise ValueError("Service is disabled or no longer exists")
             rows = await conn.fetch(
                 """SELECT * FROM cookie_core_stored_cookies
                    WHERE user_id=$1 AND service_id=$2
@@ -234,6 +292,7 @@ class CookieSessionCore:
                     "secure": row["secure"],
                     "httpOnly": row["http_only"],
                     "sameSite": row["same_site"] or "Lax",
+                    "hostOnly": row["host_only"],
                     "created_at": row["created_at"],
                     "updated_at": row["updated_at"],
                     **({"expires": row["expires_at"].timestamp()} if row["expires_at"] else {}),
@@ -277,18 +336,33 @@ class CookieSessionCore:
         )
         return raw
 
-    async def proxy_grant(self, *, raw_grant: str, service_id: str) -> ConsumedLaunch:
+    async def proxy_grant(
+        self,
+        *,
+        raw_grant: str,
+        service_id: str,
+        renew_ttl_seconds: int | None = None,
+    ) -> ConsumedLaunch:
         """Validates a proxy grant and loads cookies for its exact owner tuple."""
         service_uuid = UUID(service_id)
         async with self.pool.acquire() as conn:
             grant = await conn.fetchrow(
-                """SELECT g.user_id,g.service_id,s.*
-                   FROM cookie_core_proxy_grants g
-                   JOIN cookie_core_services s ON s.id=g.service_id AND s.enabled=true
-                   WHERE g.token_hash=$1 AND g.service_id=$2
-                     AND g.revoked_at IS NULL AND g.expires_at > now()""",
+                """WITH renewed AS (
+                     UPDATE cookie_core_proxy_grants
+                     SET expires_at = CASE
+                       WHEN $3::integer IS NULL THEN expires_at
+                       ELSE now() + make_interval(secs => $3::integer)
+                     END
+                     WHERE token_hash=$1 AND service_id=$2
+                       AND revoked_at IS NULL AND expires_at > now()
+                     RETURNING user_id,service_id
+                   )
+                   SELECT g.user_id,g.service_id,s.*
+                   FROM renewed g
+                   JOIN cookie_core_services s ON s.id=g.service_id AND s.enabled=true""",
                 self._token_hash(raw_grant),
                 service_uuid,
+                renew_ttl_seconds,
             )
             if not grant:
                 raise ValueError("Proxy grant is invalid or expired")
@@ -315,6 +389,7 @@ class CookieSessionCore:
                 "secure": row["secure"],
                 "httpOnly": row["http_only"],
                 "sameSite": row["same_site"] or "Lax",
+                "hostOnly": row["host_only"],
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
                 **({"expires": row["expires_at"].timestamp()} if row["expires_at"] else {}),
@@ -335,6 +410,18 @@ class CookieSessionCore:
             proxy_hostname=grant.get("proxy_hostname"),
         )
 
+    async def renew_proxy_grant(self, raw_grant: str, service_id: str, ttl_seconds: int) -> bool:
+        result = await self.pool.execute(
+            """UPDATE cookie_core_proxy_grants
+               SET expires_at=now() + make_interval(secs => $3::integer)
+               WHERE token_hash=$1 AND service_id=$2
+                 AND revoked_at IS NULL AND expires_at > now()""",
+            self._token_hash(raw_grant),
+            UUID(service_id),
+            ttl_seconds,
+        )
+        return result == "UPDATE 1"
+
     async def service_id_for_proxy_hostname(self, hostname: str) -> str | None:
         value = await self.pool.fetchval(
             """SELECT id FROM cookie_core_services
@@ -345,11 +432,15 @@ class CookieSessionCore:
 
     async def capture_set_cookie(
         self, launch: ConsumedLaunch, raw_cookie: str, upstream_host: str
-    ) -> str | None:
+    ) -> CapturedCookie | None:
         """Stores an upstream Set-Cookie without ever forwarding it to the browser."""
         parsed = SimpleCookie()
         try:
-            parsed.load(raw_cookie)
+            # Python 3.12 and several exporters do not understand newer cookie
+            # attributes. They affect browser partitioning/priority, not the
+            # server-side value, so ignore the attribute instead of dropping
+            # the authentication cookie altogether.
+            parsed.load(_strip_extended_cookie_attributes(raw_cookie))
         except Exception:
             return None
         if len(parsed) != 1:
@@ -363,7 +454,12 @@ class CookieSessionCore:
                     expires_at = expires_at.replace(tzinfo=timezone.utc)
             except (TypeError, ValueError):
                 expires_at = None
-        domain = (morsel["domain"] or upstream_host).lower()
+        raw_domain = morsel["domain"].strip()
+        host_only = not bool(raw_domain)
+        # A leading Domain dot has no semantic meaning in RFC 6265. Store one
+        # canonical key and keep host-only behavior in the dedicated column so
+        # rotations/deletions cannot leave a second stale copy behind.
+        domain = (raw_domain or upstream_host).lower().strip(".")
         path = morsel["path"] or "/"
         same_site = (morsel["samesite"] or "Lax").capitalize()
         if same_site not in {"Strict", "Lax", "None"}:
@@ -377,6 +473,7 @@ class CookieSessionCore:
             secure=bool(morsel["secure"]),
             http_only=bool(morsel["httponly"]),
             same_site=same_site,
+            host_only=host_only,
         )
         policy = ServicePolicy(
             id=launch.service_id,
@@ -390,11 +487,11 @@ class CookieSessionCore:
             validate_cookie(cookie, policy, self.blocked_cookie_public_suffixes)
         except ValueError:
             return None
-        expired = (
-            morsel["max-age"].strip().startswith("-")
-            or morsel["max-age"].strip() == "0"
-            or (expires_at is not None and expires_at <= _now())
-        )
+        try:
+            max_age_expired = bool(morsel["max-age"]) and int(morsel["max-age"]) <= 0
+        except ValueError:
+            max_age_expired = False
+        expired = max_age_expired or (expires_at is not None and expires_at <= _now())
         async with self.pool.acquire() as conn, conn.transaction():
             args = (
                 launch.user_id,
@@ -417,13 +514,14 @@ class CookieSessionCore:
                 await conn.execute(
                     """INSERT INTO cookie_core_stored_cookies(
                          user_id,service_id,name,domain,path,
-                         encrypted_value,nonce,expires_at,secure,http_only,same_site
-                       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                         encrypted_value,nonce,expires_at,secure,http_only,same_site,host_only
+                       ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                        ON CONFLICT(user_id,service_id,name,domain,path)
                        DO UPDATE SET encrypted_value=excluded.encrypted_value,
                          nonce=excluded.nonce,expires_at=excluded.expires_at,
                          secure=excluded.secure,http_only=excluded.http_only,
-                         same_site=excluded.same_site,revoked_at=NULL,updated_at=now()""",
+                         same_site=excluded.same_site,host_only=excluded.host_only,
+                         revoked_at=NULL,updated_at=now()""",
                     *args,
                     encrypted.ciphertext,
                     encrypted.nonce,
@@ -431,6 +529,7 @@ class CookieSessionCore:
                     cookie.secure,
                     cookie.http_only,
                     cookie.same_site,
+                    cookie.host_only,
                 )
             await conn.execute(
                 """INSERT INTO cookie_core_audit_logs(
@@ -440,7 +539,7 @@ class CookieSessionCore:
                 UUID(launch.service_id),
                 '{"count":1}',
             )
-        return name
+        return CapturedCookie(cookie=cookie, deleted=expired)
 
     async def import_local_storage(
         self,

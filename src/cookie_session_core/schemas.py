@@ -33,8 +33,14 @@ class ServiceInput(BaseModel):
     @field_validator("upstream_url")
     @classmethod
     def https_only(cls, value: HttpUrl) -> HttpUrl:
-        if value.scheme != "https":
-            raise ValueError("Service URL must use HTTPS")
+        parsed = urlparse(str(value))
+        if (
+            value.scheme != "https"
+            or parsed.username
+            or parsed.password
+            or parsed.fragment
+        ):
+            raise ValueError("Service URL must be HTTPS without credentials or fragment")
         return value
 
     @field_validator("allowed_domains")
@@ -95,6 +101,8 @@ class ServiceInput(BaseModel):
             or ":" in value
             or "." not in value
             or value.startswith(".")
+            or value in PRIVATE_HOSTING_SUFFIXES
+            or value.endswith((".localhost", ".local", ".internal"))
             or any(not part or len(part) > 63 for part in value.split("."))
             or any(
                 not all(char.isalnum() or char == "-" for char in part)
@@ -110,7 +118,14 @@ class ServiceInput(BaseModel):
     @field_validator("allowed_paths")
     @classmethod
     def clean_paths(cls, values: list[str]) -> list[str]:
-        if not all(value.startswith("/") and len(value) <= 500 for value in values):
+        if not all(
+            value.startswith("/")
+            and len(value) <= 500
+            and "?" not in value
+            and "#" not in value
+            and not any(ord(char) < 32 for char in value)
+            for value in values
+        ):
             raise ValueError("Every allowed path must start with /")
         return list(dict.fromkeys(values))
 
@@ -143,6 +158,8 @@ class ServiceInput(BaseModel):
             host == domain or host.endswith("." + domain) for domain in self.allowed_domains
         ):
             raise ValueError("Service hostname must be inside allowed_domains")
+        if self.proxy_hostname and self.proxy_hostname == host:
+            raise ValueError("proxy_hostname cannot be the same as the upstream hostname")
         return self
 
 
@@ -176,6 +193,13 @@ class CfClearanceInject(BaseModel):
             or ":" in value
             or "." not in value
             or any(not part or len(part) > 63 for part in value.split("."))
+            or any(
+                not part.isascii()
+                or part.startswith("-")
+                or part.endswith("-")
+                or not all(char.isalnum() or char == "-" for char in part)
+                for part in value.split(".")
+            )
         ):
             raise ValueError("domain must be a plain DNS hostname")
         return value
@@ -197,6 +221,14 @@ class CfSolveUrlInput(BaseModel):
     url: HttpUrl = Field(description="URL protected by Cloudflare to solve")
     impersonate: str = Field(default="chrome124", min_length=3, max_length=40)
     max_timeout_seconds: int = Field(default=120, ge=15, le=600)
+
+    @field_validator("url")
+    @classmethod
+    def solve_url_is_https(cls, value: HttpUrl) -> HttpUrl:
+        parsed = urlparse(str(value))
+        if value.scheme != "https" or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError("Solve URL must be HTTPS without credentials or fragment")
+        return value
 
 
 class LocalStorageImport(BaseModel):

@@ -54,6 +54,17 @@ def _devtools_checked(value: object) -> bool:
     }
 
 
+def _boolean(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"1", "true", "yes", "checked", "✓", "✔"}:
+        return True
+    if normalized in {"0", "false", "no", "unchecked", "✗", "✘"}:
+        return False
+    return default
+
+
 def _expiry(value: object) -> datetime | None:
     if value in (None, "", 0, "0", "Session"):
         return None
@@ -93,16 +104,18 @@ def parse_cookie_import(raw: str, default_domain: str) -> list[ImportedCookie]:
         for item in items:
             if not isinstance(item, dict) or not item.get("name") or "value" not in item:
                 raise ValueError("A JSON cookie is missing name/value")
+            raw_domain = str(item.get("domain") or default_domain)
             output.append(
                 ImportedCookie(
                     name=str(item["name"]),
                     value=str(item["value"]),
-                    domain=str(item.get("domain") or default_domain),
+                    domain=raw_domain,
                     path=str(item.get("path") or "/"),
                     expires_at=_expiry(item.get("expirationDate") or item.get("expires")),
-                    secure=bool(item.get("secure", True)),
-                    http_only=bool(item.get("httpOnly", True)),
+                    secure=_boolean(item.get("secure"), True),
+                    http_only=_boolean(item.get("httpOnly"), True),
                     same_site=_same_site(item.get("sameSite")),
+                    host_only=_boolean(item.get("hostOnly"), not raw_domain.startswith(".")),
                 )
             )
     else:
@@ -122,7 +135,9 @@ def parse_cookie_import(raw: str, default_domain: str) -> list[ImportedCookie]:
         )
         if is_netscape:
             for line in lines:
-                domain, _, path, secure, expires, name, value = line.split("\t", 6)
+                domain, include_subdomains, path, secure, expires, name, value = line.split(
+                    "\t", 6
+                )
                 output.append(
                     ImportedCookie(
                         name=name,
@@ -131,6 +146,7 @@ def parse_cookie_import(raw: str, default_domain: str) -> list[ImportedCookie]:
                         path=path or "/",
                         expires_at=_expiry(expires),
                         secure=secure.upper() == "TRUE",
+                        host_only=include_subdomains.upper() != "TRUE",
                     )
                 )
         elif is_devtools:
@@ -152,13 +168,19 @@ def parse_cookie_import(raw: str, default_domain: str) -> list[ImportedCookie]:
                         http_only=(_devtools_checked(rest[2]) if len(rest) > 2 else True),
                         secure=(_devtools_checked(rest[3]) if len(rest) > 3 else True),
                         same_site=same_site,
+                        host_only=not domain.startswith("."),
                     )
                 )
         else:
             parsed = SimpleCookie()
             parsed.load(text.removeprefix("Cookie:").strip())
             output = [
-                ImportedCookie(name=name, value=morsel.value, domain=default_domain)
+                ImportedCookie(
+                    name=name,
+                    value=morsel.value,
+                    domain=default_domain,
+                    host_only=True,
+                )
                 for name, morsel in parsed.items()
             ]
 
@@ -171,7 +193,7 @@ def parse_cookie_import(raw: str, default_domain: str) -> list[ImportedCookie]:
             raise ValueError("Cookie value contains control characters")
         if item.same_site == "None" and not item.secure:
             raise ValueError("SameSite=None cookies must be Secure")
-    keys = {(item.name, item.domain.lower(), item.path) for item in output}
+    keys = {(item.name, item.domain.lower().lstrip("."), item.path) for item in output}
     if len(keys) != len(output):
         raise ValueError("Cookie import contains duplicates")
     return output
@@ -205,7 +227,7 @@ def validate_cookie(
     if cookie.name.startswith("__Secure-") and not cookie.secure:
         raise ValueError("__Secure- cookies must be Secure")
     if cookie.name.startswith("__Host-") and (
-        not cookie.secure or cookie.path != "/" or cookie.domain.startswith(".")
+        not cookie.secure or cookie.path != "/" or not cookie.host_only
     ):
         raise ValueError("__Host- cookies must be Secure, host-only, and use path /")
     explicitly_allowed = any(

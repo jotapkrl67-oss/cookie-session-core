@@ -333,13 +333,20 @@ class _CurlResponseStream(httpx.AsyncByteStream):
         await self.response.aclose()
 
 
-def _coerce_bytes_body(body: Any) -> bytes:
+class RequestBodyTooLarge(httpx.StreamError):
+    pass
+
+
+def _coerce_bytes_body(body: Any, max_bytes: int | None = None) -> bytes:
     if body is None:
         return b""
     if isinstance(body, (bytes, bytearray, memoryview)):
-        return bytes(body)
+        output = bytes(body)
+        if max_bytes is not None and len(output) > max_bytes:
+            raise RequestBodyTooLarge("Proxy request body exceeded the configured limit")
+        return output
     if isinstance(body, str):
-        return body.encode("utf-8")
+        return _coerce_bytes_body(body.encode("utf-8"), max_bytes)
     if isinstance(body, Iterable) and not isinstance(body, (str, AsyncIterable)):
         out = bytearray()
         try:
@@ -352,7 +359,13 @@ def _coerce_bytes_body(body: Any) -> bytes:
                     out += chunk.encode("utf-8")
                 else:
                     raise TypeError
+                if max_bytes is not None and len(out) > max_bytes:
+                    raise RequestBodyTooLarge(
+                        "Proxy request body exceeded the configured limit"
+                    )
             return bytes(out)
+        except RequestBodyTooLarge:
+            raise
         except Exception as exc:
             logger.debug("Could not coerce iterable request body: %s", type(exc).__name__)
     raise TypeError(
@@ -362,13 +375,13 @@ def _coerce_bytes_body(body: Any) -> bytes:
     )
 
 
-async def _materialize_async_body(body: Any) -> bytes:
+async def _materialize_async_body(body: Any, max_bytes: int | None = None) -> bytes:
     if body is None:
         return b""
     if isinstance(body, (bytes, bytearray, memoryview)):
-        return bytes(body)
+        return _coerce_bytes_body(body, max_bytes)
     if isinstance(body, str):
-        return body.encode("utf-8")
+        return _coerce_bytes_body(body.encode("utf-8"), max_bytes)
     if isinstance(body, AsyncIterable):
         out = bytearray()
         async for chunk in body:
@@ -380,9 +393,11 @@ async def _materialize_async_body(body: Any) -> bytes:
                 out += chunk.encode("utf-8")
             else:
                 raise TypeError(f"Unsupported async body chunk: {type(chunk).__name__!r}")
+            if max_bytes is not None and len(out) > max_bytes:
+                raise RequestBodyTooLarge("Proxy request body exceeded the configured limit")
         return bytes(out)
     if isinstance(body, Iterable):
-        return _coerce_bytes_body(body)
+        return _coerce_bytes_body(body, max_bytes)
     raise TypeError(f"Unsupported HTTP body type: {type(body).__name__!r}")
 
 
@@ -502,6 +517,7 @@ class BrowserLikeClient:
         self._curl: CurlAsyncSession | None = None
         self._httpx_fallback: httpx.AsyncClient | None = None
         self._curl_lock = asyncio.Lock()
+        self._egress_identity = settings.egress_id if settings is not None else "direct"
         self.clearance = ClearanceCache(ttl_seconds=clearance_ttl_seconds)
         self.cloudflare_sessions = CloudflareSessionStore(
             default_ttl_seconds=(
@@ -519,6 +535,7 @@ class BrowserLikeClient:
                 negative_cache_seconds=(
                     settings.cf_solve_negative_cache_seconds if settings else 10
                 ),
+                egress_identity=self._egress_identity,
             )
             if cloudflare_cookie_provider is not None
             else None
@@ -561,6 +578,8 @@ class BrowserLikeClient:
                         max_connections=self._max_connections,
                         max_keepalive_connections=20,
                     ),
+                    proxy=(self._settings.httpx_proxy_url if self._settings else None),
+                    trust_env=False,
                 )
 
     async def aclose(self) -> None:
@@ -650,8 +669,9 @@ class BrowserLikeClient:
         else:
             self._oai_sessions.move_to_end(key)
         state.request_count += 1
-        if state.request_count % 3 == 0:
-            state.current_session_id = _generate_uuid4()
+        # The session/device IDs are inputs to upstream anti-abuse signatures.
+        # Rotating a healthy session on an arbitrary request count invalidates
+        # in-flight operations and can turn a valid login into a 401/403.
         self._replace_oai_headers(request, state.stable_device_id, state.current_session_id)
 
     def _record_oai_result(self, request: httpx.Request, status: int) -> bool:
@@ -814,6 +834,11 @@ class BrowserLikeClient:
         return stream_attr
 
     async def _materialize_request_body(self, request: httpx.Request) -> bytes:
+        max_bytes = (
+            self._settings.proxy_max_request_body_bytes
+            if self._settings is not None
+            else 50_000_000
+        )
         sync_body: Any = None
         try:
             sync_body = request.content
@@ -823,20 +848,20 @@ class BrowserLikeClient:
             sync_body = None
         if sync_body is not None:
             try:
-                return _coerce_bytes_body(sync_body)
+                return _coerce_bytes_body(sync_body, max_bytes)
             except TypeError:
                 pass
 
         raw_stream = self._get_request_stream(request)
         if isinstance(raw_stream, AsyncIterable):
-            return await _materialize_async_body(raw_stream)
+            return await _materialize_async_body(raw_stream, max_bytes)
         if isinstance(raw_stream, Iterable):
-            return _coerce_bytes_body(raw_stream)
+            return _coerce_bytes_body(raw_stream, max_bytes)
 
         content_attr = getattr(request, "_content", None)
         if content_attr is not None:
             try:
-                return _coerce_bytes_body(content_attr)
+                return _coerce_bytes_body(content_attr, max_bytes)
             except TypeError:
                 pass
 
@@ -866,14 +891,18 @@ class BrowserLikeClient:
         parsed = urlparse(str(request.url))
         domain = parsed.hostname or ""
         clearance = self.clearance.get(domain)
-        provider_cookies = self.cloudflare_sessions.cookies_for_url(str(request.url))
+        provider_cookies = self.cloudflare_sessions.cookies_for_url(
+            str(request.url), egress_identity=self._egress_identity
+        )
         replacements = [(cookie.name, cookie.value) for cookie in provider_cookies]
         if clearance and not any(name == "cf_clearance" for name, _value in replacements):
             replacements.insert(0, ("cf_clearance", clearance))
         if replacements:
             existing = headers.get("Cookie") or headers.get("cookie") or ""
             _replace_header(headers, "Cookie", _merge_cookie_header(existing, replacements))
-        provider_session = self.cloudflare_sessions.get(str(request.url))
+        provider_session = self.cloudflare_sessions.get(
+            str(request.url), egress_identity=self._egress_identity
+        )
         if provider_session is not None:
             _replace_header(headers, "User-Agent", provider_session.user_agent)
 
@@ -934,6 +963,18 @@ class BrowserLikeClient:
             "headers": headers,
             "timeout": timeout,
         }
+        if self._settings is not None and self._settings.upstream_proxy_url:
+            curl_args["proxy"] = self._settings.upstream_proxy_url
+            if self._settings.upstream_proxy_username:
+                curl_args["proxy_auth"] = (
+                    self._settings.upstream_proxy_username,
+                    self._settings.upstream_proxy_password,
+                )
+        else:
+            # Keep the declared egress identity truthful. Operators that need
+            # a proxy must configure UPSTREAM_PROXY_* explicitly rather than
+            # relying on process-global HTTP(S)_PROXY variables.
+            curl_args["proxy"] = ""
         if not has_accept_encoding:
             curl_args["accept_encoding"] = "gzip, deflate, br, zstd"
         if body_bytes:
@@ -1130,7 +1171,9 @@ class BrowserLikeClient:
         clearance_was_used = False
         rotate_oai_next = False
         saw_managed_challenge = False
-        observed_provider_generation = self.cloudflare_sessions.generation(url_str)
+        observed_provider_generation = self.cloudflare_sessions.generation(
+            url_str, egress_identity=self._egress_identity
+        )
         provider_refresh_attempted = False
 
         for attempt in range(max_attempts):
@@ -1220,10 +1263,17 @@ class BrowserLikeClient:
 
             if not request_replayable:
                 metrics.increment("cf_replay_rejected_total")
-                await resp.aclose()
-                raise httpx.StreamError(
-                    "Upstream retry was blocked because the request is not safely replayable"
+                logger.warning(
+                    "upstream_retry_skipped method=%s url=%s status=%s reason=non_replayable",
+                    request.method,
+                    log_url,
+                    status,
                 )
+                # The request has already reached the upstream. Replaying could
+                # duplicate a purchase/message/action, but replacing the real
+                # response with a proxy exception also breaks the application.
+                # Preserve the first response and let the browser handle it.
+                return resp
 
             rotate_oai_next = self._record_oai_result(request, status)
 

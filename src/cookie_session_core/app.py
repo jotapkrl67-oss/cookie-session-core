@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import math
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -24,8 +25,16 @@ from .browser_client import BrowserLikeClient
 from .cloudflare_provider import HttpCloudflareCookieProvider
 from .config import get_settings
 from .core import CookieSessionCore
+from .diagnostic_logging import configure_diagnostic_logging
+from .egress import PublicAddressGuard
 from .redaction import install_redaction
-from .reverse_proxy import ReverseProxy, escaped_proxy_service_id, proxy_hostname_candidates
+from .reverse_proxy import (
+    LAUNCH_QUERY_PARAM,
+    LEGACY_LAUNCH_QUERY_PARAM,
+    ReverseProxy,
+    escaped_proxy_service_id,
+    proxy_hostname_candidates,
+)
 from .schemas import (
     CfClearanceInject,
     CfSolveUrlInput,
@@ -37,7 +46,8 @@ from .schemas import (
 
 logger = logging.getLogger("cookie_session_core")
 install_redaction(logger)
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
+_SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 
 
 async def _transparent_service(proxy: ReverseProxy, headers, fallback: str | None):
@@ -78,23 +88,54 @@ class RateLimiter:
 async def _cleanup_tokens(pool: asyncpg.Pool) -> None:
     while True:
         await asyncio.sleep(60)
-        with suppress(Exception):
+        try:
             await pool.execute("DELETE FROM cookie_core_launch_tokens WHERE expires_at < now()")
             await pool.execute("DELETE FROM cookie_core_proxy_grants WHERE expires_at < now()")
+        except Exception as exc:
+            logger.warning("token_cleanup_failed error=%s", type(exc).__name__)
+
+
+async def _initialize_database(settings) -> asyncpg.Pool:
+    last_error: Exception | None = None
+    for attempt in range(1, settings.database_startup_attempts + 1):
+        pool: asyncpg.Pool | None = None
+        try:
+            pool = await asyncpg.create_pool(
+                settings.database_url,
+                min_size=1,
+                max_size=20,
+                command_timeout=30,
+            )
+            await pool.fetchval("SELECT 1")
+            schema = files("cookie_session_core").joinpath("schema.sql").read_text(
+                encoding="utf-8"
+            )
+            await pool.execute(schema)
+            return pool
+        except Exception as exc:
+            last_error = exc
+            if pool is not None:
+                with suppress(Exception):
+                    await pool.close()
+            if attempt >= settings.database_startup_attempts:
+                break
+            delay = min(0.5 * (2 ** (attempt - 1)), settings.database_startup_max_delay_seconds)
+            logger.warning(
+                "database_startup_retry attempt=%s/%s delay_seconds=%.1f error=%s",
+                attempt,
+                settings.database_startup_attempts,
+                delay,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+    assert last_error is not None
+    raise last_error
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
-    pool = await asyncpg.create_pool(
-        settings.database_url,
-        min_size=1,
-        max_size=20,
-        command_timeout=30,
-    )
-    await pool.fetchval("SELECT 1")
-    schema = files("cookie_session_core").joinpath("schema.sql").read_text(encoding="utf-8")
-    await pool.execute(schema)
+    pool = await _initialize_database(settings)
     core = CookieSessionCore(
         pool,
         settings.vault_key,
@@ -125,16 +166,27 @@ async def lifespan(app: FastAPI):
     app.state.browser_client = browser_client
     app.state.jwt_verifier = SupabaseJWTVerifier(settings)
     app.state.rate_limiter = RateLimiter()
-    yield
-    cleanup_task.cancel()
-    with suppress(asyncio.CancelledError):
-        await cleanup_task
-    await browser_client.aclose()
-    await pool.close()
+    app.state.egress_guard = PublicAddressGuard(cache_seconds=settings.egress_dns_cache_seconds)
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+        try:
+            await browser_client.aclose()
+        finally:
+            await pool.close()
 
 
 def create_app() -> FastAPI:
     resolved = get_settings()
+    configure_diagnostic_logging(
+        file_path=resolved.log_file_path,
+        level=resolved.log_level,
+        max_bytes=resolved.log_max_bytes,
+        backup_count=resolved.log_backup_count,
+    )
     app = FastAPI(
         title="Cookie Session Core",
         version=APP_VERSION,
@@ -157,7 +209,7 @@ def create_app() -> FastAPI:
     )
 
     @app.exception_handler(RequestValidationError)
-    async def sanitized_validation_error(_: Request, exc: RequestValidationError):
+    async def sanitized_validation_error(request: Request, exc: RequestValidationError):
         errors = [
             {
                 "field": ".".join(str(part) for part in item.get("loc", ()) if part != "body"),
@@ -165,6 +217,13 @@ def create_app() -> FastAPI:
             }
             for item in exc.errors()
         ]
+        logger.warning(
+            "request_validation_failed request_id=%s method=%s path=%s fields=%s",
+            getattr(request.state, "request_id", "unknown"),
+            request.method,
+            request.url.path,
+            ",".join(item["field"] for item in errors) or "unknown",
+        )
         return JSONResponse(
             {"detail": "Invalid request", "errors": errors},
             status_code=422,
@@ -172,7 +231,14 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
-        request_id = request.headers.get("x-request-id") or secrets.token_hex(12)
+        supplied_request_id = request.headers.get("x-request-id", "")
+        request_id = (
+            supplied_request_id
+            if _SAFE_REQUEST_ID.fullmatch(supplied_request_id)
+            else secrets.token_hex(12)
+        )
+        request.state.request_id = request_id
+        started_at = time.monotonic()
         try:
             public_hosts = proxy_hostname_candidates(request.headers, request.url.hostname)
             escaped_service_id = escaped_proxy_service_id(
@@ -185,11 +251,14 @@ def create_app() -> FastAPI:
                 request.url.path.startswith("/proxy/")
                 or request.cookies.get("__Secure-cookie_core_proxy")
                 or escaped_service_id
-                or request.query_params.get("launch")
+                or request.query_params.get(LAUNCH_QUERY_PARAM)
+                or request.query_params.get(LEGACY_LAUNCH_QUERY_PARAM)
             ):
                 raw_grant = request.cookies.get(
                     "__Secure-cookie_core_proxy"
-                ) or request.query_params.get("launch")
+                ) or request.query_params.get(LAUNCH_QUERY_PARAM)
+                if not raw_grant:
+                    raw_grant = request.query_params.get(LEGACY_LAUNCH_QUERY_PARAM)
                 if not raw_grant and escaped_service_id:
                     raw_grant = request.cookies.get(
                         f"__Secure-cookie_core_proxy_{escaped_service_id}"
@@ -234,13 +303,22 @@ def create_app() -> FastAPI:
             else:
                 response = await call_next(request)
         except HTTPException as exc:
+            logger.warning(
+                "request_rejected request_id=%s method=%s host=%s path=%s status=%s reason=%s",
+                request_id,
+                request.method,
+                request.headers.get("x-forwarded-host") or request.url.hostname,
+                request.url.path,
+                exc.status_code,
+                exc.detail,
+            )
             response = JSONResponse(
                 {"detail": exc.detail},
                 status_code=exc.status_code,
                 headers=exc.headers,
             )
         except Exception as exc:
-            logger.error(
+            logger.exception(
                 "request_failed request_id=%s method=%s host=%s path=%s error=%s",
                 request_id,
                 request.method,
@@ -251,6 +329,31 @@ def create_app() -> FastAPI:
             response = JSONResponse(
                 {"detail": "Internal service error", "request_id": request_id},
                 status_code=500,
+            )
+        request.app.state.proxy.finalize_browser_response(request, response)
+        duration_ms = round((time.monotonic() - started_at) * 1000)
+        if response.status_code >= 400:
+            level = logging.ERROR if response.status_code >= 500 else logging.WARNING
+            logger.log(
+                level,
+                "request_completed_with_error request_id=%s method=%s host=%s path=%s status=%s duration_ms=%s source=%s",
+                request_id,
+                request.method,
+                request.headers.get("x-forwarded-host") or request.url.hostname,
+                request.url.path,
+                response.status_code,
+                duration_ms,
+                response.headers.get("x-cookie-core-error-source", "application"),
+            )
+        elif duration_ms >= request.app.state.settings.log_slow_request_ms:
+            logger.warning(
+                "slow_request request_id=%s method=%s host=%s path=%s status=%s duration_ms=%s",
+                request_id,
+                request.method,
+                request.headers.get("x-forwarded-host") or request.url.hostname,
+                request.url.path,
+                response.status_code,
+                duration_ms,
             )
         response.headers["X-Request-ID"] = request_id
         response.headers["Cache-Control"] = "no-store"
@@ -271,11 +374,26 @@ def create_app() -> FastAPI:
         return response
 
     @app.get("/health/live")
-    async def health(request: Request):
+    async def health():
         return {
             "status": "ok",
             "version": APP_VERSION,
-            "database": bool(await request.app.state.pool.fetchval("SELECT 1")),
+            "proxy": True,
+        }
+
+    @app.get("/health/ready")
+    async def readiness(request: Request):
+        try:
+            database_ready = bool(
+                await asyncio.wait_for(request.app.state.pool.fetchval("SELECT 1"), timeout=3)
+            )
+        except Exception as exc:
+            logger.warning("readiness_failed dependency=database error=%s", type(exc).__name__)
+            raise HTTPException(503, "Database is not ready") from exc
+        return {
+            "status": "ready",
+            "version": APP_VERSION,
+            "database": database_ready,
             "proxy": True,
         }
 
@@ -338,9 +456,14 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(404, str(exc))
         service = await request.app.state.pool.fetchrow(
-            "SELECT upstream_url,proxy_hostname FROM cookie_core_services WHERE id=$1",
+            """SELECT upstream_url,proxy_hostname FROM cookie_core_services
+               WHERE id=$1 AND enabled=true""",
             service_id,
         )
+        # The service can be disabled/deleted between issue_launch and this
+        # lookup. Handle that race as an ordinary 404 instead of a server error.
+        if not service:
+            raise HTTPException(404, "Service not found or disabled")
         upstream = urlparse(service["upstream_url"])
         upstream_path = upstream.path or "/"
         base = (
@@ -350,7 +473,7 @@ def create_app() -> FastAPI:
             + f"/proxy/{service_id}"
         )
         query = upstream.query
-        query += ("&" if query else "") + urlencode({"launch": token})
+        query += ("&" if query else "") + urlencode({LAUNCH_QUERY_PARAM: token})
         return {
             "launch_url": f"{base}{upstream_path}?{query}",
             "expires_in": 30,
@@ -385,6 +508,10 @@ def create_app() -> FastAPI:
         admin: AuthenticatedUser = Depends(current_admin),
     ):
         request.app.state.rate_limiter.check("admin-write", admin.id, 20)
+        try:
+            await request.app.state.egress_guard.check(str(data.upstream_url))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         row = await request.app.state.pool.fetchrow(
             """INSERT INTO cookie_core_services(
                  name,category,upstream_url,proxy_hostname,allowed_domains,allowed_paths,
@@ -417,6 +544,10 @@ def create_app() -> FastAPI:
         admin: AuthenticatedUser = Depends(current_admin),
     ):
         request.app.state.rate_limiter.check("admin-write", admin.id, 20)
+        try:
+            await request.app.state.egress_guard.check(str(data.upstream_url))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         row = await request.app.state.pool.fetchrow(
             """UPDATE cookie_core_services SET
                  name=$1,category=$2,upstream_url=$3,proxy_hostname=$4,allowed_domains=$5,
@@ -679,7 +810,10 @@ def create_app() -> FastAPI:
             logger.info("Admin %s cleared entire cf_clearance cache", admin.id)
         else:
             cache.clear(domain)
-            request.app.state.browser_client.cloudflare_sessions.clear(domain)
+            request.app.state.browser_client.cloudflare_sessions.clear(
+                domain,
+                egress_identity=request.app.state.browser_client._egress_identity,
+            )
             logger.info("Admin %s cleared cf_clearance domain=%s", admin.id, domain)
         return Response(status_code=204)
 
@@ -723,6 +857,7 @@ def create_app() -> FastAPI:
                     if request.app.state.browser_client._cookie_coordinator
                     else "disabled"
                 ),
+                "egress_id": request.app.state.browser_client._egress_identity,
             },
         }
 
@@ -749,16 +884,16 @@ def create_app() -> FastAPI:
 
         request.app.state.rate_limiter.check("cf-solve", admin.id, 2)
         client: BrowserLikeClient = request.app.state.browser_client
-        saved_impersonate = client.impersonate
-        if data.impersonate != saved_impersonate:
-            client.impersonate = data.impersonate
-            async with client._curl_lock:
-                if client._curl is not None:
-                    with suppress(Exception):
-                        await client._curl.close()
-                    client._curl = None
-
         url = str(data.url)
+        try:
+            await request.app.state.egress_guard.check(url)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if data.impersonate not in request.app.state.settings.cf_solver_impersonate_targets:
+            raise HTTPException(400, "Unsupported browser impersonation target")
+        # Do not mutate/close the shared transport while real users are making
+        # requests. Rotation is coordinated inside BrowserLikeClient when a
+        # genuine challenge is observed.
         headers = {
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "accept-language": "en-US,en;q=0.9",
@@ -772,7 +907,12 @@ def create_app() -> FastAPI:
                 probe_request, stream=False, materialized_body=b""
             )
         except Exception as exc:
-            raise HTTPException(502, f"Upstream probe failed: {exc}")
+            logger.warning(
+                "cf_probe_failed request_id=%s error=%s",
+                getattr(request.state, "request_id", "unknown"),
+                type(exc).__name__,
+            )
+            raise HTTPException(502, "Upstream probe failed") from exc
 
         status = probe.status_code
         body = probe.content or b""
@@ -806,7 +946,9 @@ def create_app() -> FastAPI:
 
         coordinator = client._cookie_coordinator
         if coordinator is not None and is_challenge:
-            observed_generation = client.cloudflare_sessions.generation(url)
+            observed_generation = client.cloudflare_sessions.generation(
+                url, egress_identity=client._egress_identity
+            )
             try:
                 session = await coordinator.refresh(
                     url,
@@ -886,7 +1028,9 @@ def create_app() -> FastAPI:
         ``Path=/proxy/<service-id>/`` session cookie.
         """
         query = request.scope.get("query_string", b"").decode("latin-1")
-        destination = request.url.path + "/" + ("?" + query if query else "")
+        raw_path = request.scope.get("raw_path", request.url.path.encode("latin-1"))
+        path_value = raw_path.decode("latin-1") if isinstance(raw_path, bytes) else request.url.path
+        destination = path_value + "/" + ("?" + query if query else "")
         return RedirectResponse(destination, status_code=307)
 
     @app.api_route(

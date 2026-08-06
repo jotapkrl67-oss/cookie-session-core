@@ -80,10 +80,33 @@ CREATE TABLE IF NOT EXISTS cookie_core_stored_cookies (
   secure boolean NOT NULL DEFAULT true,
   http_only boolean NOT NULL DEFAULT true,
   same_site text CHECK (same_site IN ('Strict','Lax','None') OR same_site IS NULL),
+  host_only boolean NOT NULL DEFAULT true,
   revoked_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE cookie_core_stored_cookies ADD COLUMN IF NOT EXISTS host_only boolean;
+UPDATE cookie_core_stored_cookies
+SET host_only = (domain NOT LIKE '.%')
+WHERE host_only IS NULL;
+ALTER TABLE cookie_core_stored_cookies ALTER COLUMN host_only SET DEFAULT true;
+ALTER TABLE cookie_core_stored_cookies ALTER COLUMN host_only SET NOT NULL;
+-- RFC 6265 ignores a leading Domain dot. Older imports retained it, allowing
+-- the same cookie scope to exist twice and making a later Set-Cookie deletion
+-- miss the stale row. Keep the newest scope and canonicalize the domain key.
+DELETE FROM cookie_core_stored_cookies older
+USING cookie_core_stored_cookies newer
+WHERE older.user_id=newer.user_id
+  AND older.service_id=newer.service_id
+  AND older.name=newer.name
+  AND older.domain<>newer.domain
+  AND lower(trim(both '.' from older.domain))=lower(trim(both '.' from newer.domain))
+  AND older.path=newer.path
+  AND (older.revoked_at IS NULL,older.updated_at,older.created_at,older.id)
+      < (newer.revoked_at IS NULL,newer.updated_at,newer.created_at,newer.id);
+UPDATE cookie_core_stored_cookies
+SET domain=lower(trim(both '.' from domain))
+WHERE domain<>lower(trim(both '.' from domain));
 CREATE UNIQUE INDEX IF NOT EXISTS cookie_core_stored_cookies_scope_key
   ON cookie_core_stored_cookies(user_id,service_id,name,domain,path);
 CREATE INDEX IF NOT EXISTS cookie_core_stored_cookies_owner_idx
